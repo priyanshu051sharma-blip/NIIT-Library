@@ -1,0 +1,153 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Start SmartLib stack",
+			"type": "shell",
+			"command": "docker compose up --build -d",
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "test-shell",
+			"type": "shell",
+			"command": "echo hello",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "start-ai-service",
+			"type": "shell",
+			"command": "cd /d \"d:\\Khushi Kathuria\\niit_lib\\NIIT-Library\\ai-service\"; $env:AI_MODE='real'; $env:PERSON_MODEL='runs/smartlib-person-smoke/weights/best.pt'; $env:SEAT_MODEL='runs/chair-smoke/weights/best.pt'; $env:ROBOFLOW_API_KEY='MauBf5CLvmmWiaPUqRzL'; $env:ROBOFLOW_WORKSPACE='khushi-kathuria'; $env:ROBOFLOW_WORKFLOW_ID='general-segmentation-api-3'; uvicorn app.main:app --host 0.0.0.0 --port 8001",
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "check-python",
+			"type": "shell",
+			"command": "python --version; py --version",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "check-uvicorn",
+			"type": "shell",
+			"command": "python -m uvicorn --version",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "start-ai-service",
+			"type": "shell",
+			"command": "Set-Location \"d:\\Khushi Kathuria\\niit_lib\\NIIT-Library\\ai-service\"; $env:AI_MODE='real'; $env:PERSON_MODEL='runs/smartlib-person-smoke/weights/best.pt'; $env:SEAT_MODEL='runs/chair-smoke/weights/best.pt'; $env:ROBOFLOW_API_KEY='MauBf5CLvmmWiaPUqRzL'; $env:ROBOFLOW_WORKSPACE='khushi-kathuria'; $env:ROBOFLOW_WORKFLOW_ID='general-segmentation-api-3'; python -m uvicorn app.main:app --host 0.0.0.0 --port 8001",
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "find-short-path",
+			"type": "shell",
+			"command": "cmd /c dir /x \"d:\\Khushi Kathuria\\niit_lib\"",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "pwd-test",
+			"type": "shell",
+			"command": "pwd; Get-Location",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "pytest-roboflow",
+			"type": "shell",
+			"command": "python -m pytest ai-service/tests/test_roboflow_workflow.py -q",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "start-ai-service",
+			"type": "shell",
+			"command": "cd ai-service; $env:AI_MODE='real'; $env:PERSON_MODEL='runs/smartlib-person-smoke/weights/best.pt'; $env:SEAT_MODEL='runs/chair-smoke/weights/best.pt'; $env:ROBOFLOW_API_KEY='MauBf5CLvmmWiaPUqRzL'; $env:ROBOFLOW_WORKSPACE='khushi-kathuria'; $env:ROBOFLOW_WORKFLOW_ID='general-segmentation-api-3'; python -m uvicorn app.main:app --host 0.0.0.0 --port 8001",
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "install-python-deps",
+			"type": "shell",
+			"command": "python -m pip install -r ai-service/requirements.txt; python -m pip install -r backend/requirements.txt",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "install-frontend-deps",
+			"type": "shell",
+			"command": "cd frontend; npm install",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "test-cmd-wrapper",
+			"type": "shell",
+			"command": "cmd /c \"cd /d \"\"d:\\Khushi Kathuria\\niit_lib\\NIIT-Library\\ai-service\"\" && python --version\"",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "test-relative-cmd",
+			"type": "shell",
+			"command": "cmd /c \"cd ai-service && python --version\"",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "start-ai-service-script",
+			"type": "shell",
+			"command": "powershell -ExecutionPolicy Bypass -File .\\scripts\\start_ai_service.ps1",
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "check-ai-health",
+			"type": "shell",
+			"command": "powershell -Command \"try { (Invoke-WebRequest -Uri http://localhost:8001/ai/health -UseBasicParsing).Content } catch { Write-Output 'not ready' }\"",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "check-ai-health",
+			"type": "shell",
+			"command": "try { (Invoke-WebRequest -Uri http://localhost:8001/ai/health -UseBasicParsing).Content } catch { 'not ready' }",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "start-backend-script",
+			"type": "shell",
+			"command": "powershell -ExecutionPolicy Bypass -File .\\scripts\\start_backend.ps1",
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "curl-backend-health",
+			"type": "shell",
+			"command": "curl http://localhost:8000/health",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "backend-health-direct",
+			"type": "shell",
+			"command": "Invoke-WebRequest -Uri 'http://localhost:8000/health' -UseBasicParsing | Select-Object -ExpandProperty Content",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "start-frontend-script",
+			"type": "shell",
+			"command": "powershell -ExecutionPolicy Bypass -File .\\scripts\\start_frontend.ps1",
+			"isBackground": true,
+			"problemMatcher": []
+		}
+	]
+}

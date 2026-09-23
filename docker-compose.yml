@@ -33,8 +33,11 @@ services:
       GENERIC_SEAT_FALLBACK: "true"
       GENERIC_CONFIDENCE: "0.2"
       GENERIC_INFERENCE_SIZE: 1280
-      ROBOFLOW_API_KEY: ${ROBOFLOW_API_KEY:-}
+      ROBOFLOW_API_KEY: ${ROBOFLOW_API_KEY:-MauBf5CLvmmWiaPUqRzL}
       ROBOFLOW_MODEL_ID: ${ROBOFLOW_MODEL_ID:-chair-occupancy-detection-2/3}
+      ROBOFLOW_WORKSPACE: ${ROBOFLOW_WORKSPACE:-khushi-kathuria}
+      ROBOFLOW_WORKFLOW_ID: ${ROBOFLOW_WORKFLOW_ID:-general-segmentation-api-3}
+      ROBOFLOW_WORKFLOW_PARAMETERS: ${ROBOFLOW_WORKFLOW_PARAMETERS:-'{"classes":["person","chair","seat","object"]}'}
     volumes:
       - ./ai-service/runs/smartlib-person-smoke/weights/best.pt:/models/person.pt:ro
       - ./ai-service/runs/smartlib-seat-states/weights/best.pt:/models/chair.pt:ro

@@ -157,17 +157,19 @@ def current_snapshot() -> dict[str, Any]:
     if ai_snapshot:
         people = int(ai_snapshot.get("people_count", people))
         occupied = int(ai_snapshot.get("occupied_seats", occupied))
-        detected_empty = int(ai_snapshot.get("empty_seats", total - occupied))
-        detected_total = occupied + detected_empty
-        total = detected_total if ai_snapshot.get("mode") != "mock" and detected_total else max(TOTAL_SEATS, detected_total)
-    empty = max(total - occupied, 0)
+        detected_empty = max(int(ai_snapshot.get("empty_seats", total - occupied)), 0)
+        detected_total = max(occupied + detected_empty, 0)
+        total = detected_total if ai_snapshot.get("mode") != "mock" and detected_total > 0 else max(TOTAL_SEATS, total)
+        empty = max(detected_total - occupied, 0) if detected_total > 0 else max(total - occupied, 0)
+    else:
+        empty = max(total - occupied, 0)
     return {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "people_count": people,
         "total_seats": total,
         "occupied_seats": occupied,
         "empty_seats": empty,
-        "occupancy_percentage": round((occupied / total) * 100, 1) if total else 0,
+        "occupancy_percentage": round((occupied / max((occupied + empty), 1)) * 100, 1) if (occupied + empty) > 0 else 0,
         "entries": int(ai_snapshot.get("entries", 86)) if ai_snapshot else 86,
         "exits": int(ai_snapshot.get("exits", 61)) if ai_snapshot else 61,
         "status": occupancy_status(occupied / total if total else 0),

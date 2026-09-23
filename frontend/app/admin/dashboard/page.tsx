@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import LiveDetection from "../../components/LiveDetection";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const TOTAL_SEATS = 70;
@@ -144,6 +145,12 @@ export default function AdminDashboard() {
               )}
             </div>
           </div>
+        </section>
+
+        <section style={{ marginTop: 28 }}>
+          <h2>Live library view</h2>
+          <p style={{ color: "#5f5852" }}>Check the live camera feed and chair occupancy from the admin dashboard.</p>
+          <LiveDetection />
         </section>
       </div>
     </main>

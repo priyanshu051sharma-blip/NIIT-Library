@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import LiveDetection from "../../components/LiveDetection";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const TOTAL_SEATS = 70;
@@ -209,6 +210,12 @@ export default function StudentDashboard() {
               </button>
             </div>
           </div>
+        </section>
+
+        <section style={{ marginTop: 28 }}>
+          <h2>Live library view</h2>
+          <p style={{ color: "#5f5852" }}>Check the current camera view and chair occupancy before choosing a seat.</p>
+          <LiveDetection />
         </section>
       </div>
     </main>
