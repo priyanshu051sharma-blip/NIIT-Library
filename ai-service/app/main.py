@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import json
+import base64
 import threading
 import time
+from urllib import request
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,8 @@ from pydantic import BaseModel, Field
 
 try:
     import cv2
+    if not hasattr(cv2, "setNumThreads"):
+        cv2.setNumThreads = lambda *_: None
     from ultralytics import YOLO
 except ImportError:
     cv2 = None
@@ -31,6 +35,9 @@ GENERIC_INFERENCE_SIZE = int(os.getenv("GENERIC_INFERENCE_SIZE", "1280"))
 GENERIC_SEAT_FALLBACK = os.getenv("GENERIC_SEAT_FALLBACK", "true").lower() == "true"
 TILE_INFERENCE = os.getenv("TILE_INFERENCE", "false").lower() == "true"
 TILE_OVERLAP = float(os.getenv("TILE_OVERLAP", "0.15"))
+ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY", "")
+ROBOFLOW_MODEL_ID = os.getenv("ROBOFLOW_MODEL_ID", "chair-occupancy-detection-2/3")
+ROBOFLOW_API_URL = os.getenv("ROBOFLOW_API_URL", "https://serverless.roboflow.com")
 
 class FrameResult(BaseModel):
     people_count: int = 0
@@ -47,6 +54,7 @@ class VisionEngine:
         self.person_model = None
         self.fallback_model = None
         self.seat_model = None
+        self.roboflow_seat_model = bool(ROBOFLOW_API_KEY and ROBOFLOW_MODEL_ID)
         self.last_count = 0
         self.total_seats = int(os.getenv("TOTAL_SEATS", "120"))
         self.seats = self.load_seats()
@@ -61,6 +69,30 @@ class VisionEngine:
                 self.fallback_model = YOLO(FALLBACK_MODEL_PATH)
             if SEAT_MODEL_PATH and Path(SEAT_MODEL_PATH).exists():
                 self.seat_model = YOLO(SEAT_MODEL_PATH)
+
+    def _predict_roboflow_seats(self, frame: Any) -> list[dict[str, Any]]:
+        success, encoded = cv2.imencode(".jpg", frame)
+        if not success:
+            return []
+        endpoint = f"{ROBOFLOW_API_URL.rstrip('/')}/{ROBOFLOW_MODEL_ID}?api_key={ROBOFLOW_API_KEY}&confidence={SEAT_CONFIDENCE * 100:g}"
+        request_data = request.Request(endpoint, data=base64.b64encode(encoded.tobytes()), method="POST", headers={"Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            with request.urlopen(request_data, timeout=15) as response:
+                predictions = json.loads(response.read().decode("utf-8")).get("predictions", [])
+        except Exception:
+            return []
+        detections = []
+        for prediction in predictions:
+            width = float(prediction.get("width", 0))
+            height = float(prediction.get("height", 0))
+            center_x = float(prediction.get("x", 0))
+            center_y = float(prediction.get("y", 0))
+            detections.append({
+                "bbox": [center_x - width / 2, center_y - height / 2, center_x + width / 2, center_y + height / 2],
+                "confidence": float(prediction.get("confidence", 0)),
+                "class_name": str(prediction.get("class", "")).lower(),
+            })
+        return detections
 
     @staticmethod
     def load_seats() -> list[dict[str, Any]]:
@@ -123,10 +155,10 @@ class VisionEngine:
         return kept
 
     def process(self, frame: Any = None) -> FrameResult:
-        if frame is None or (self.person_model is None and self.fallback_model is None):
+        if frame is None or (self.person_model is None and self.fallback_model is None and not self.roboflow_seat_model):
             return self.mock_result()
         detector = self.person_model or self.fallback_model
-        person_detections = self._predict_detections(detector, frame, [0], PERSON_CONFIDENCE)
+        person_detections = self._predict_detections(detector, frame, [0], PERSON_CONFIDENCE) if detector else []
         people = len(person_detections)
         generic_detections = []
         if GENERIC_SEAT_FALLBACK and self.fallback_model is not None:
@@ -148,10 +180,18 @@ class VisionEngine:
             empty = max(total_seats - occupied, 0)
         delta = people - self.last_count
         self.last_count = people
-        self.latest = FrameResult(people_count=people, occupied_seats=occupied, empty_seats=empty, occupancy_percentage=round(occupied / total_seats * 100, 1), entries=max(delta, 0), exits=max(-delta, 0), mode="yolo-seat" if self.seat_model else "yolo")
+        if not person_detections and self.roboflow_seat_model:
+            people = occupied
+        self.latest = FrameResult(people_count=people, occupied_seats=occupied, empty_seats=empty, occupancy_percentage=round(occupied / total_seats * 100, 1), entries=max(delta, 0), exits=max(-delta, 0), mode="roboflow-seat" if self.roboflow_seat_model and not self.seat_model else ("yolo-seat" if self.seat_model else "yolo"))
         return self.latest
 
     def detect_seats(self, frame: Any, person_results: Any) -> tuple[int, int, int]:
+        if self.roboflow_seat_model:
+            detections = self._predict_roboflow_seats(frame)
+            occupied = sum("occupied" in detection["class_name"] or "guest" in detection["class_name"] for detection in detections)
+            empty = sum("empty" in detection["class_name"] or "available" in detection["class_name"] or "vacant" in detection["class_name"] for detection in detections)
+            if detections:
+                return len(detections), occupied, empty
         if self.seat_model is not None:
             detections = self._predict_detections(self.seat_model, frame, list(self.seat_model.names), SEAT_CONFIDENCE)
             if not detections:
@@ -230,7 +270,8 @@ engine = VisionEngine()
 
 @app.get("/ai/health")
 def health():
-    return {"status": "ok", "mode": "yolo" if engine.person_model else "mock", "stream_running": bool(engine.capture_thread and engine.capture_thread.is_alive()), "person_model": MODEL_PATH, "seat_model": SEAT_MODEL_PATH or None}
+    mode = "roboflow-seat" if engine.roboflow_seat_model else ("yolo" if engine.person_model else "mock")
+    return {"status": "ok", "mode": mode, "stream_running": bool(engine.capture_thread and engine.capture_thread.is_alive()), "person_model": MODEL_PATH, "seat_model": SEAT_MODEL_PATH or None, "roboflow_model": ROBOFLOW_MODEL_ID if engine.roboflow_seat_model else None}
 
 @app.get("/ai/occupancy", response_model=FrameResult)
 def occupancy():

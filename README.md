@@ -18,6 +18,8 @@ AI-powered library occupancy and space management. SmartLib counts people and se
 
 For a native Python run: `pip install -r backend/requirements.txt && uvicorn backend.app.main:app --reload --port 8000`. Run the vision service with `AI_MODE=real PERSON_MODEL=ai-service/runs/smartlib-person-smoke/weights/best.pt SEAT_MODEL=ai-service/runs/chair-smoke/weights/best.pt uvicorn app.main:app --reload --port 8001` from the `ai-service` directory. The Compose setup mounts these trained models and runs the AI service in real mode by default.
 
+To use the Roboflow chair occupancy model shown in the project, set `ROBOFLOW_API_KEY` before starting Compose. The default model ID is `chair-occupancy-detection-2/3`; override `ROBOFLOW_MODEL_ID` when using another deployed version. Roboflow inference is used when the key is present, while the local YOLO model remains available when it is not.
+
 ## Real video mode
 
 Set `AI_MODE=real`, install the AI requirements, configure `VIDEO_SOURCE` as a webcam index, local video path, or RTSP URL, and set `PERSON_MODEL` to a YOLO model. YOLO tracking uses persistent track IDs for people. Seat occupancy uses configurable polygons from `config/cameras.example.json`; a future trained model can be supplied with `SEAT_MODEL` for occupied/empty seat classes.

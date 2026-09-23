@@ -157,7 +157,9 @@ def current_snapshot() -> dict[str, Any]:
     if ai_snapshot:
         people = int(ai_snapshot.get("people_count", people))
         occupied = int(ai_snapshot.get("occupied_seats", occupied))
-        total = max(TOTAL_SEATS, int(ai_snapshot.get("empty_seats", total - occupied)) + occupied)
+        detected_empty = int(ai_snapshot.get("empty_seats", total - occupied))
+        detected_total = occupied + detected_empty
+        total = detected_total if ai_snapshot.get("mode") != "mock" and detected_total else max(TOTAL_SEATS, detected_total)
     empty = max(total - occupied, 0)
     return {
         "timestamp": datetime.utcnow().isoformat() + "Z",
