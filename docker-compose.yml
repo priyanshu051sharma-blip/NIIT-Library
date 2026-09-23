@@ -28,6 +28,11 @@ services:
       SEAT_CONFIG: /config/cameras.example.json
       VIDEO_SOURCE: "0"
       TOTAL_SEATS: 70
+      TILE_INFERENCE: "true"
+      TILE_OVERLAP: "0.15"
+      GENERIC_SEAT_FALLBACK: "true"
+      GENERIC_CONFIDENCE: "0.2"
+      GENERIC_INFERENCE_SIZE: 1280
     volumes:
       - ./ai-service/runs/smartlib-person-smoke/weights/best.pt:/models/person.pt:ro
       - ./ai-service/runs/smartlib-seat-states/weights/best.pt:/models/chair.pt:ro

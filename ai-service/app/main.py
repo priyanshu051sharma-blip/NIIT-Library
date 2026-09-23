@@ -25,6 +25,12 @@ FALLBACK_MODEL_PATH = os.getenv("FALLBACK_MODEL", "")
 SEAT_MODEL_PATH = os.getenv("SEAT_MODEL", "")
 SOURCE = os.getenv("VIDEO_SOURCE", "0")
 SEAT_CONFIDENCE = float(os.getenv("SEAT_CONFIDENCE", "0.35"))
+PERSON_CONFIDENCE = float(os.getenv("PERSON_CONFIDENCE", "0.25"))
+GENERIC_CONFIDENCE = float(os.getenv("GENERIC_CONFIDENCE", "0.2"))
+GENERIC_INFERENCE_SIZE = int(os.getenv("GENERIC_INFERENCE_SIZE", "1280"))
+GENERIC_SEAT_FALLBACK = os.getenv("GENERIC_SEAT_FALLBACK", "true").lower() == "true"
+TILE_INFERENCE = os.getenv("TILE_INFERENCE", "false").lower() == "true"
+TILE_OVERLAP = float(os.getenv("TILE_OVERLAP", "0.15"))
 
 class FrameResult(BaseModel):
     people_count: int = 0
@@ -65,13 +71,77 @@ class VisionEngine:
         except (OSError, json.JSONDecodeError):
             return []
 
+    @staticmethod
+    def _iou(first: list[float], second: list[float]) -> float:
+        left = max(first[0], second[0])
+        top = max(first[1], second[1])
+        right = min(first[2], second[2])
+        bottom = min(first[3], second[3])
+        intersection = max(0, right - left) * max(0, bottom - top)
+        first_area = max(0, first[2] - first[0]) * max(0, first[3] - first[1])
+        second_area = max(0, second[2] - second[0]) * max(0, second[3] - second[1])
+        return intersection / max(first_area + second_area - intersection, 1)
+
+    def _predict_detections(self, model: Any, frame: Any, classes: list[int], confidence: float, tiled: bool | None = None, imgsz: int = 640) -> list[dict[str, Any]]:
+        height, width = frame.shape[:2]
+        tiles = [(frame, 0, 0)]
+        if TILE_INFERENCE if tiled is None else tiled:
+            tile_width = width // 2
+            tile_height = height // 2
+            step_x = max(1, int(tile_width * (1 - TILE_OVERLAP)))
+            step_y = max(1, int(tile_height * (1 - TILE_OVERLAP)))
+            tiles = [
+                (frame[y:min(y + tile_height, height), x:min(x + tile_width, width)], x, y)
+                for y in (0, step_y)
+                for x in (0, step_x)
+            ]
+
+        detections: list[dict[str, Any]] = []
+        for tile, offset_x, offset_y in tiles:
+            result = model.predict(tile, conf=confidence, classes=classes, imgsz=imgsz, verbose=False)[0]
+            if result.boxes is None:
+                continue
+            for coordinates, score, class_id in zip(
+                result.boxes.xyxy.cpu().tolist(),
+                result.boxes.conf.cpu().tolist(),
+                result.boxes.cls.cpu().tolist(),
+            ):
+                detections.append({
+                    "bbox": [coordinates[0] + offset_x, coordinates[1] + offset_y, coordinates[2] + offset_x, coordinates[3] + offset_y],
+                    "confidence": float(score),
+                    "class_id": int(class_id),
+                })
+
+        kept: list[dict[str, Any]] = []
+        for detection in sorted(detections, key=lambda item: item["confidence"], reverse=True):
+            if all(
+                detection["class_id"] != existing["class_id"]
+                or self._iou(detection["bbox"], existing["bbox"]) < 0.5
+                for existing in kept
+            ):
+                kept.append(detection)
+        return kept
+
     def process(self, frame: Any = None) -> FrameResult:
         if frame is None or (self.person_model is None and self.fallback_model is None):
             return self.mock_result()
         detector = self.person_model or self.fallback_model
-        results = detector.track(frame, persist=True, classes=[0], verbose=False)
-        people = len(results[0].boxes) if results and results[0].boxes is not None else 0
-        seat_total, occupied, empty = self.detect_seats(frame, results)
+        person_detections = self._predict_detections(detector, frame, [0], PERSON_CONFIDENCE)
+        people = len(person_detections)
+        generic_detections = []
+        if GENERIC_SEAT_FALLBACK and self.fallback_model is not None:
+            generic_people_detections = self._predict_detections(self.fallback_model, frame, [0], GENERIC_CONFIDENCE, tiled=False, imgsz=GENERIC_INFERENCE_SIZE)
+            generic_chair_detections = self._predict_detections(self.fallback_model, frame, [56], GENERIC_CONFIDENCE, tiled=False, imgsz=GENERIC_INFERENCE_SIZE)
+            generic_detections = generic_people_detections + generic_chair_detections
+            generic_people = len(generic_people_detections)
+            if generic_people:
+                people = generic_people
+        seat_total, occupied, empty = self.detect_seats(frame, person_detections)
+        generic_chairs = sum(detection["class_id"] == 56 for detection in generic_detections)
+        if GENERIC_SEAT_FALLBACK and generic_chairs and seat_total < generic_chairs * 0.5:
+            seat_total = generic_chairs
+            occupied = min(people, seat_total)
+            empty = seat_total - occupied
         total_seats = seat_total or self.total_seats
         if not seat_total:
             occupied = min(people, total_seats)
@@ -83,11 +153,10 @@ class VisionEngine:
 
     def detect_seats(self, frame: Any, person_results: Any) -> tuple[int, int, int]:
         if self.seat_model is not None:
-            results = self.seat_model.predict(frame, conf=SEAT_CONFIDENCE, verbose=False)
-            boxes = results[0].boxes
-            if boxes is None or boxes.cls is None:
+            detections = self._predict_detections(self.seat_model, frame, list(self.seat_model.names), SEAT_CONFIDENCE)
+            if not detections:
                 return 0, 0, 0
-            class_ids = [int(class_id) for class_id in boxes.cls.cpu().tolist()]
+            class_ids = [detection["class_id"] for detection in detections]
             names = self.seat_model.names
             occupied_ids = {
                 class_id for class_id, name in names.items()
@@ -107,13 +176,13 @@ class VisionEngine:
         if self.seats:
             occupied = self.seat_count(frame, person_results)
             return len(self.seats), occupied, max(len(self.seats) - occupied, 0)
-        occupied = min(len(person_results[0].boxes) if person_results and person_results[0].boxes is not None else 0, self.total_seats)
+        occupied = min(len(person_results), self.total_seats)
         return self.total_seats, occupied, max(self.total_seats - occupied, 0)
 
     def seat_count(self, frame: Any, results: Any) -> int:
         height, width = frame.shape[:2]
         person_points = []
-        boxes = results[0].boxes.xyxy.cpu().tolist() if results and results[0].boxes is not None else []
+        boxes = [detection["bbox"] for detection in results]
         for left, top, right, bottom in boxes:
             person_points.append((int((left + right) / 2), int(bottom)))
         occupied = 0
