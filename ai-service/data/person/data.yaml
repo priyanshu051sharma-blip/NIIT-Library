@@ -1,6 +1,0 @@
-path: C:/Users/PRIYANSHU SHARMA/Desktop/Library system/ai-service/data/person
-train: images/train
-val: images/valid
-test: images/test
-names:
-  0: person

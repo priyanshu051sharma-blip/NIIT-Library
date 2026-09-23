@@ -11,3 +11,8 @@ frontend/.next/
 *.sqlite
 *.sqlite3
 *.log
+
+# Training datasets are kept local and are not part of the repository.
+archive (1)/
+Chair Occupancy Detection 3.v1i.yolov9/
+ai-service/data/person/
