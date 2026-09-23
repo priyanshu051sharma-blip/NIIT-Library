@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: smartlib
+      POSTGRES_USER: smartlib
+      POSTGRES_PASSWORD: smartlib
+    ports: ["5432:5432"]
+    volumes: ["smartlib-postgres:/var/lib/postgresql/data", "./database:/docker-entrypoint-initdb.d:ro"]
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+  backend:
+    build: ./backend
+    environment:
+      APP_MODE: mock
+      CORS_ORIGINS: http://localhost:3000
+    ports: ["8000:8000"]
+    depends_on: [postgres, redis]
+  ai-service:
+    build: ./ai-service
+    environment:
+      AI_MODE: real
+      PERSON_MODEL: /models/person.pt
+      SEAT_MODEL: /models/chair.pt
+      SEAT_CONFIG: /config/cameras.example.json
+      VIDEO_SOURCE: "0"
+      TOTAL_SEATS: 70
+    volumes:
+      - ./ai-service/runs/smartlib-person-smoke/weights/best.pt:/models/person.pt:ro
+      - ./ai-service/runs/chair-smoke/weights/best.pt:/models/chair.pt:ro
+      - ./config/cameras.example.json:/config/cameras.example.json:ro
+    ports: ["8001:8001"]
+  frontend:
+    build: ./frontend
+    ports: ["3000:3000"]
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    depends_on: [backend]
+volumes:
+  smartlib-postgres:

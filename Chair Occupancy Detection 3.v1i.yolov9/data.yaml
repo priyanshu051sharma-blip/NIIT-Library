@@ -1,0 +1,13 @@
+train: train/images
+val: valid/images
+test: test/images
+
+nc: 3
+names: ['empty chair', 'guest on chair', 'occupied chair']
+
+roboflow:
+  workspace: priyanshu-woil7
+  project: chair-occupancy-detection-3-bhsmn
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/priyanshu-woil7/chair-occupancy-detection-3-bhsmn/dataset/1

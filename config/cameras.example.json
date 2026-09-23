@@ -1,0 +1,20 @@
+{
+  "cameras": [
+    {
+      "id": "cam-main",
+      "name": "Main reading floor",
+      "location": "North wing",
+      "rtsp_url": "rtsp://username:password@camera-host/stream",
+      "zone_id": "reading",
+      "enabled": false
+    }
+  ],
+  "zones": [
+    {"id": "reading", "name": "Reading Area", "capacity": 70},
+    {"id": "computer", "name": "Computer Area", "capacity": 50},
+    {"id": "hall", "name": "Reading Hall", "capacity": 80}
+  ],
+  "seats": [
+    {"seat_id": "S001", "zone_id": "reading", "camera_id": "cam-main", "coordinates": [[120, 180], [180, 180], [180, 240], [120, 240]]}
+  ]
+}
