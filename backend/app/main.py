@@ -6,8 +6,9 @@ import math
 import os
 import secrets
 from urllib import request
+from urllib.parse import urlencode
 
-from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_validator
@@ -213,6 +214,21 @@ def require_staff(user: Role = Depends(current_user)):
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "smartlib-backend", "mode": os.getenv("APP_MODE", "mock")}
+
+@app.post("/api/process/frame")
+async def process_browser_frame(frame_data: str = Form(...), _: Role = Depends(current_user)):
+    payload = urlencode({"frame_data": frame_data}).encode()
+    vision_request = request.Request(
+        f"{AI_SERVICE_URL}/ai/process-frame/base64",
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with request.urlopen(vision_request, timeout=10) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"AI frame processing unavailable: {error}") from error
+    return {"success": True, "occupancy": result, "timestamp": datetime.utcnow().isoformat() + "Z"}
 
 @app.api_route("/api/auth/demo", methods=["GET", "POST"])
 async def demo_login(request: Request, role: str | None = None):

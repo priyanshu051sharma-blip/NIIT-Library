@@ -9,7 +9,7 @@ from typing import Any
 
 import numpy as np
 
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile
 from pydantic import BaseModel, Field
 
 try:
@@ -183,5 +183,16 @@ async def process_frame(file: UploadFile = File(...)):
     if cv2 is None:
         return engine.mock_result()
     import numpy as np
+    frame = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
+    return engine.process(frame)
+
+@app.post("/ai/process-frame/base64", response_model=FrameResult)
+async def process_frame_base64(frame_data: str = Form(...)):
+    if cv2 is None:
+        return engine.mock_result()
+    import base64
+    if "," in frame_data:
+        frame_data = frame_data.split(",", 1)[1]
+    payload = base64.b64decode(frame_data)
     frame = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
     return engine.process(frame)
