@@ -30,7 +30,7 @@ services:
       TOTAL_SEATS: 70
     volumes:
       - ./ai-service/runs/smartlib-person-smoke/weights/best.pt:/models/person.pt:ro
-      - ./ai-service/runs/chair-smoke/weights/best.pt:/models/chair.pt:ro
+      - ./ai-service/runs/smartlib-seat-states/weights/best.pt:/models/chair.pt:ro
       - ./yolo11n.pt:/models/yolo11n.pt:ro
       - ./config/cameras.example.json:/config/cameras.example.json:ro
     ports: ["8001:8001"]
