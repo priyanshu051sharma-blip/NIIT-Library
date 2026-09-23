@@ -21,6 +21,7 @@ except ImportError:
 
 app = FastAPI(title="SmartLib AI Vision Service", version="0.1.0")
 MODEL_PATH = os.getenv("PERSON_MODEL", "yolo11n.pt")
+FALLBACK_MODEL_PATH = os.getenv("FALLBACK_MODEL", "")
 SEAT_MODEL_PATH = os.getenv("SEAT_MODEL", "")
 SOURCE = os.getenv("VIDEO_SOURCE", "0")
 SEAT_CONFIDENCE = float(os.getenv("SEAT_CONFIDENCE", "0.35"))
@@ -38,6 +39,7 @@ class FrameResult(BaseModel):
 class VisionEngine:
     def __init__(self):
         self.person_model = None
+        self.fallback_model = None
         self.seat_model = None
         self.last_count = 0
         self.total_seats = int(os.getenv("TOTAL_SEATS", "120"))
@@ -46,7 +48,11 @@ class VisionEngine:
         self.stop_event = threading.Event()
         self.latest = self.mock_result()
         if YOLO and os.getenv("AI_MODE", "mock") == "real":
-            self.person_model = YOLO(MODEL_PATH)
+            person_path = Path(MODEL_PATH)
+            if person_path.exists():
+                self.person_model = YOLO(str(person_path))
+            if FALLBACK_MODEL_PATH and Path(FALLBACK_MODEL_PATH).exists():
+                self.fallback_model = YOLO(FALLBACK_MODEL_PATH)
             if SEAT_MODEL_PATH and Path(SEAT_MODEL_PATH).exists():
                 self.seat_model = YOLO(SEAT_MODEL_PATH)
 
@@ -60,13 +66,15 @@ class VisionEngine:
             return []
 
     def process(self, frame: Any = None) -> FrameResult:
-        if self.person_model is None or frame is None:
+        if frame is None or (self.person_model is None and self.fallback_model is None):
             return self.mock_result()
-        results = self.person_model.track(frame, persist=True, classes=[0], verbose=False)
+        detector = self.person_model or self.fallback_model
+        results = detector.track(frame, persist=True, classes=[0], verbose=False)
         people = len(results[0].boxes) if results and results[0].boxes is not None else 0
         seat_total, occupied, empty = self.detect_seats(frame, results)
         total_seats = seat_total or self.total_seats
-        if not seat_total and self.seat_model is None:
+        if not seat_total:
+            occupied = min(people, total_seats)
             empty = max(total_seats - occupied, 0)
         delta = people - self.last_count
         self.last_count = people
