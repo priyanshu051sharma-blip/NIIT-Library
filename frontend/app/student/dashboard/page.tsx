@@ -41,12 +41,15 @@ export default function StudentDashboard() {
   });
   const [bookingForm, setBookingForm] = useState<BookingForm>({
     roomId: "DR-01",
-    date: new Date().toISOString().slice(0, 10),
+    date: "",
     startTime: "10:00",
     endTime: "11:00",
   });
 
   useEffect(() => {
+    const today = new Date().toISOString().slice(0, 10);
+    setBookingForm((prev) => ({ ...prev, date: prev.date || today }));
+
     const savedToken = localStorage.getItem("smartlib_token") || "demo-student";
     const savedStudent = localStorage.getItem("smartlib_student") || "ENR-2024-1048";
     setToken(savedToken);

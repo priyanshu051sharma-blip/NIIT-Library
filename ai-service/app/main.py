@@ -315,17 +315,14 @@ class VisionEngine:
             occupied = min(people, seat_total)
             empty = seat_total - occupied
         total_seats = seat_total or self.total_seats
-        # Keep the seat count aligned with the actual person detections: if the model reports
-        # more occupied chairs than people, clamp to the detected human count and treat the
-        # remaining visible chairs as empty. This preserves the correct 2 occupied / 11 empty
-        # breakdown and the correct percentage for the live library view.
-        if people > 0 and total_seats > 0:
-            if occupied > people or occupied >= total_seats or empty < 0:
-                occupied = min(people, total_seats)
-                empty = max(total_seats - occupied, 0)
-            elif occupied < people:
-                occupied = min(int(people), int(total_seats))
-                empty = max(int(total_seats) - occupied, 0)
+        # Keep seat occupancy aligned to the actual person detections. If the camera sees 2 people,
+        # then only 2 seats should be counted as occupied; any remaining chair detections should be
+        # reported as empty seats instead of inflating the occupancy count.
+        if people > 0:
+            if total_seats <= 0:
+                total_seats = max(int(people), 1)
+            occupied = min(int(people), int(total_seats))
+            empty = max(int(total_seats) - occupied, 0)
         elif not seat_total:
             total_seats = max(int(total_seats or 0), int(people))
             occupied = min(people, total_seats)

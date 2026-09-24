@@ -25,13 +25,8 @@ function normalizeDetectionResult(occupancy: Partial<DetectionResult> | null | u
   let correctedEmpty = empty;
 
   if (people > 0) {
-    if (correctedOccupied > people || correctedOccupied >= totalSeats || correctedEmpty < 0) {
-      correctedOccupied = Math.min(people, totalSeats);
-      correctedEmpty = Math.max(totalSeats - correctedOccupied, 0);
-    } else if (correctedOccupied < people) {
-      correctedOccupied = Math.min(people, totalSeats);
-      correctedEmpty = Math.max(totalSeats - correctedOccupied, 0);
-    }
+    correctedOccupied = Math.min(people, totalSeats);
+    correctedEmpty = Math.max(totalSeats - correctedOccupied, 0);
   } else if (totalSeats > 0) {
     correctedOccupied = 0;
     correctedEmpty = totalSeats;
