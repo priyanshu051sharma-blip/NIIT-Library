@@ -4,7 +4,7 @@ AI-powered library occupancy and space management. SmartLib counts people and se
 
 ## Services
 
-- `frontend`: Next.js student and staff dashboards on port 3000.
+- `frontend`: Next.js student and staff dashboards on port 3001.
 - `backend`: FastAPI REST/WebSocket API on port 8000.
 - `ai-service`: FastAPI + OpenCV + Ultralytics YOLO inference service on port 8001.
 - PostgreSQL and Redis are included in `docker-compose.yml`.
@@ -13,7 +13,7 @@ AI-powered library occupancy and space management. SmartLib counts people and se
 
 1. Copy `.env.example` to `.env` and change secrets.
 2. Run `docker compose up --build`.
-3. Open http://localhost:3000.
+3. Open http://localhost:3001.
 4. The default UI uses mock occupancy data. The API offers `demo-student` and `demo-admin` tokens for local testing.
 
 For a native Python run: `pip install -r backend/requirements.txt && uvicorn backend.app.main:app --reload --port 8000`. Run the vision service with `AI_MODE=real PERSON_MODEL=ai-service/runs/smartlib-person-smoke/weights/best.pt SEAT_MODEL=ai-service/runs/chair-smoke/weights/best.pt uvicorn app.main:app --reload --port 8001` from the `ai-service` directory. The Compose setup mounts these trained models and runs the AI service in real mode by default.
