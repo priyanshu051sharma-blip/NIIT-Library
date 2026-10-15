@@ -3,6 +3,7 @@
 import { ChangeEvent, useEffect, useRef, useState } from "react";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const AI_API = process.env.NEXT_PUBLIC_AI_SERVICE_URL || "http://localhost:8001";
 
 type DetectionResult = {
   people_count: number;
@@ -25,8 +26,17 @@ function normalizeDetectionResult(occupancy: Partial<DetectionResult> | null | u
   let correctedEmpty = empty;
 
   if (people > 0) {
-    correctedOccupied = Math.min(people, totalSeats);
-    correctedEmpty = Math.max(totalSeats - correctedOccupied, 0);
+    if (correctedOccupied > people && correctedOccupied > 0) {
+      correctedOccupied = Math.min(people, totalSeats);
+      correctedEmpty = Math.max(totalSeats - correctedOccupied, 0);
+    } else if (correctedOccupied + correctedEmpty > totalSeats) {
+      const overspill = correctedOccupied + correctedEmpty - totalSeats;
+      correctedOccupied = Math.max(0, correctedOccupied - overspill);
+      correctedEmpty = Math.max(totalSeats - correctedOccupied, 0);
+    } else if (correctedOccupied === 0 && correctedEmpty === totalSeats && totalSeats > 0) {
+      correctedOccupied = Math.min(people, totalSeats);
+      correctedEmpty = Math.max(totalSeats - correctedOccupied, 0);
+    }
   } else if (totalSeats > 0) {
     correctedOccupied = 0;
     correctedEmpty = totalSeats;
@@ -47,12 +57,49 @@ export default function LiveDetection() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const [cameraOn, setCameraOn] = useState(false);
+  const [ipCameraOn, setIpCameraOn] = useState(false);
+  const [ipCameraStatus, setIpCameraStatus] = useState("not connected");
+  const [ipStreamKey, setIpStreamKey] = useState(0);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<DetectionResult | null>(null);
   const [sourceImage, setSourceImage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => () => stopCamera(), []);
+
+  useEffect(() => {
+    if (!ipCameraOn) return;
+    let active = true;
+
+    async function refreshIpCamera() {
+      try {
+        const [statusResponse, occupancyResponse] = await Promise.all([
+          fetch(`${AI_API}/ai/camera/status`),
+          fetch(`${AI_API}/ai/occupancy`),
+        ]);
+        if (!statusResponse.ok || !occupancyResponse.ok) {
+          throw new Error("Could not read camera status or detection results.");
+        }
+        const [status, occupancy] = await Promise.all([statusResponse.json(), occupancyResponse.json()]);
+        if (!active) return;
+        setIpCameraStatus(status.status || "unknown");
+        setResult(normalizeDetectionResult(occupancy));
+        if (status.error) setError(status.error);
+        else setError(null);
+      } catch (requestError) {
+        if (!active) return;
+        setIpCameraStatus("unavailable");
+        setError(requestError instanceof Error ? requestError.message : "Could not read IP camera status.");
+      }
+    }
+
+    void refreshIpCamera();
+    const timer = window.setInterval(() => void refreshIpCamera(), 1500);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [ipCameraOn]);
 
   async function analyze(dataUrl: string) {
     setBusy(true);
@@ -88,6 +135,30 @@ export default function LiveDetection() {
     }
   }
 
+  async function startIpCamera() {
+    try {
+      setError(null);
+      const response = await fetch(`${AI_API}/ai/stream/start`, { method: "POST" });
+      if (!response.ok) throw new Error("Could not start the configured IP camera stream.");
+      stopCamera();
+      setIpStreamKey(Date.now());
+      setIpCameraOn(true);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Could not start the IP camera stream.");
+    }
+  }
+
+  async function stopIpCamera() {
+    try {
+      const response = await fetch(`${AI_API}/ai/stream/stop`, { method: "POST" });
+      if (!response.ok) throw new Error("Could not stop the IP camera stream.");
+      setIpCameraOn(false);
+      setIpCameraStatus("stopped");
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Could not stop the IP camera stream.");
+    }
+  }
+
   function stopCamera() {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
@@ -117,18 +188,21 @@ export default function LiveDetection() {
   return (
     <section style={{ background: "#fff", borderRadius: 16, padding: 24, border: "1px solid #eadfce" }}>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
-        <button onClick={cameraOn ? stopCamera : startCamera} style={buttonStyle}>{cameraOn ? "Stop live camera" : "Start live camera"}</button>
+        <button onClick={ipCameraOn ? stopIpCamera : startIpCamera} disabled={cameraOn} style={buttonStyle}>{ipCameraOn ? "Disconnect IP camera" : "Connect IP camera"}</button>
+        <button onClick={cameraOn ? stopCamera : startCamera} disabled={ipCameraOn} style={buttonStyle}>{cameraOn ? "Stop local camera" : "Use local camera"}</button>
         <label htmlFor="live-detection-upload" style={buttonStyle}>Choose image</label>
         <input id="live-detection-upload" type="file" accept="image/*" onChange={handleUpload} style={{ display: "none" }} />
         {cameraOn && <button onClick={captureFrame} disabled={busy} style={{ ...buttonStyle, background: "#1d1b19" }}>{busy ? "Detecting..." : "Detect now"}</button>}
       </div>
-      <p style={{ color: "#645d58", marginBottom: 0 }}>The camera frame is sent to the local detector and returned with chair labels and bounding boxes.</p>
+      <p style={{ color: "#645d58", marginBottom: 0 }}>
+        The IP camera connects server-side; its credentials are not sent to the browser. Status: {ipCameraStatus}
+      </p>
       {error && <p style={{ color: "#a63125" }}>{error}</p>}
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 18, marginTop: 20 }}>
         <div>
           <h3>Live source</h3>
-          {cameraOn ? <video ref={videoRef} autoPlay playsInline muted style={mediaStyle} /> : sourceImage ? <img src={sourceImage} alt="Camera source frame" style={mediaStyle} /> : <div style={emptyStyle}>Start the camera or choose an image.</div>}
+          {ipCameraOn ? <img src={`${AI_API}/ai/stream.mjpeg?session=${ipStreamKey}`} alt="Live IP camera feed" style={mediaStyle} /> : cameraOn ? <video ref={videoRef} autoPlay playsInline muted style={mediaStyle} /> : sourceImage ? <img src={sourceImage} alt="Camera source frame" style={mediaStyle} /> : <div style={emptyStyle}>Connect the IP camera, use a local camera, or choose an image.</div>}
         </div>
         <div>
           <h3>Detection result</h3>
@@ -136,7 +210,7 @@ export default function LiveDetection() {
         </div>
       </div>
 
-      {result && <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 10, marginTop: 18 }}><Metric label="Occupied" value={result.occupied_seats} /><Metric label="Empty" value={result.empty_seats} /><Metric label="Occupancy" value={`${result.occupancy_percentage}%`} /><Metric label="Mode" value={result.mode} /></div>}
+      {result && <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 10, marginTop: 18 }}><Metric label="People in view" value={result.people_count} /><Metric label="Occupied" value={result.occupied_seats} /><Metric label="Empty" value={result.empty_seats} /><Metric label="Occupancy" value={`${result.occupancy_percentage}%`} /><Metric label="Mode" value={result.mode} /></div>}
       <canvas ref={canvasRef} style={{ display: "none" }} />
     </section>
   );

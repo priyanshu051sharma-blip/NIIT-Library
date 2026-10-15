@@ -5,14 +5,19 @@ import json
 import base64
 import threading
 import time
-from urllib import request
 from pathlib import Path
 from typing import Any
+from datetime import datetime, timezone
+from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPDigestAuthHandler, HTTPPasswordMgrWithDefaultRealm, Request, build_opener
 
 import numpy as np
 
 from fastapi import FastAPI, File, Form, UploadFile
-from pydantic import BaseModel, Field
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from fastapi.responses import StreamingResponse
 
 try:
     import cv2
@@ -24,10 +29,50 @@ except ImportError:
     YOLO = None
 
 app = FastAPI(title="SmartLib AI Vision Service", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3001").split(","),
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 MODEL_PATH = os.getenv("PERSON_MODEL", "yolo11n.pt")
 FALLBACK_MODEL_PATH = os.getenv("FALLBACK_MODEL", "")
 SEAT_MODEL_PATH = os.getenv("SEAT_MODEL", "")
-SOURCE = os.getenv("VIDEO_SOURCE", "0")
+
+
+def configured_video_source() -> int | str:
+    video_source = os.getenv("VIDEO_SOURCE", "").strip()
+    rtsp_url = os.getenv("RTSP_URL", "").strip()
+    source = os.getenv("CAMERA_STREAM_URL", "").strip()
+    if not source:
+        camera_host = os.getenv("CAMERA_HOST", "").strip()
+        if camera_host:
+            protocol = os.getenv("CAMERA_PROTOCOL", "http").strip().lower()
+            port = os.getenv("CAMERA_PORT", "80").strip()
+            path = os.getenv("CAMERA_STREAM_PATH", "/cgi-bin/mjpg/video.cgi").strip()
+            if path and not path.startswith(("/", "?")):
+                path = f"/{path}"
+            host = f"[{camera_host}]" if ":" in camera_host and not camera_host.startswith("[") else camera_host
+            source = f"{protocol}://{host}:{port}{path}"
+
+    if not source:
+        source = video_source if video_source and video_source != "0" else rtsp_url or video_source or "0"
+
+    parsed = urlsplit(source)
+    username = os.getenv("CAMERA_USERNAME", "")
+    password = os.getenv("CAMERA_PASSWORD", "")
+    if parsed.scheme.lower() in {"http", "https"} and parsed.hostname:
+        host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+        netloc = f"{host}:{parsed.port}" if parsed.port else host
+        source = urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    elif parsed.scheme and parsed.hostname and (username or password) and parsed.username is None:
+        credentials = f"{quote(username, safe='')}:{quote(password, safe='')}@"
+        source = urlunsplit((parsed.scheme, credentials + parsed.netloc, parsed.path, parsed.query, parsed.fragment))
+
+    return int(source) if source.isdigit() else source
+
+
+SOURCE = configured_video_source()
 SEAT_CONFIDENCE = float(os.getenv("SEAT_CONFIDENCE", "0.15"))
 PERSON_CONFIDENCE = float(os.getenv("PERSON_CONFIDENCE", "0.25"))
 GENERIC_CONFIDENCE = float(os.getenv("GENERIC_CONFIDENCE", "0.2"))
@@ -35,7 +80,7 @@ GENERIC_INFERENCE_SIZE = int(os.getenv("GENERIC_INFERENCE_SIZE", "1280"))
 GENERIC_SEAT_FALLBACK = os.getenv("GENERIC_SEAT_FALLBACK", "true").lower() == "true"
 TILE_INFERENCE = os.getenv("TILE_INFERENCE", "true").lower() == "true"
 TILE_OVERLAP = float(os.getenv("TILE_OVERLAP", "0.15"))
-ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY", "MauBf5CLvmmWiaPUqRzL")
+ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY", "")
 ROBOFLOW_MODEL_ID = os.getenv("ROBOFLOW_MODEL_ID", "chair-occupancy-detection-2/3")
 ROBOFLOW_WORKSPACE = os.getenv("ROBOFLOW_WORKSPACE", "khushi-kathuria")
 ROBOFLOW_WORKFLOW_ID = os.getenv("ROBOFLOW_WORKFLOW_ID", "general-segmentation-api-3")
@@ -71,7 +116,7 @@ class VisionEngine:
         if self.roboflow_seat_model and InferenceHTTPClient is not None:
             client = InferenceHTTPClient(
                 api_url=ROBOFLOW_API_URL,
-                api_key=ROBOFLOW_API_KEY or "MauBf5CLvmmWiaPUqRzL"
+                api_key=ROBOFLOW_API_KEY
             )
             try:
                 self.roboflow_client = client.configure(InferenceConfiguration(
@@ -84,6 +129,12 @@ class VisionEngine:
         self.seats = self.load_seats()
         self.capture_thread: threading.Thread | None = None
         self.stop_event = threading.Event()
+        self.frame_lock = threading.Lock()
+        self.latest_frame: bytes | None = None
+        self.last_frame_at: str | None = None
+        self.camera_status = "not_configured" if SOURCE == "0" else "connecting"
+        self.camera_error: str | None = None
+        self.reconnect_attempts = 0
         self.latest = self.mock_result()
         if YOLO and os.getenv("AI_MODE", "mock") == "real":
             person_path = Path(MODEL_PATH)
@@ -93,6 +144,8 @@ class VisionEngine:
                 self.fallback_model = YOLO(FALLBACK_MODEL_PATH)
             if SEAT_MODEL_PATH and Path(SEAT_MODEL_PATH).exists():
                 self.seat_model = YOLO(SEAT_MODEL_PATH)
+                self.roboflow_seat_model = False
+                self.roboflow_workflow = False
 
     @staticmethod
     def _extract_roboflow_predictions(result: Any) -> list[dict[str, Any]]:
@@ -291,9 +344,12 @@ class VisionEngine:
         return kept
 
     def process(self, frame: Any = None) -> FrameResult:
-        if frame is None or (self.person_model is None and self.fallback_model is None and not self.roboflow_seat_model):
+        if frame is None:
             return self.mock_result()
         self.last_annotated_image = None
+        if self.person_model is None and self.fallback_model is None and not self.roboflow_seat_model:
+            self._cache_frame(frame)
+            return self.mock_result()
         detector = self.person_model or self.fallback_model
         person_detections = self._predict_detections(detector, frame, [0], PERSON_CONFIDENCE) if detector else []
         people = len(person_detections)
@@ -315,14 +371,15 @@ class VisionEngine:
             occupied = min(people, seat_total)
             empty = seat_total - occupied
         total_seats = seat_total or self.total_seats
-        # Keep seat occupancy aligned to the actual person detections. If the camera sees 2 people,
-        # then only 2 seats should be counted as occupied; any remaining chair detections should be
-        # reported as empty seats instead of inflating the occupancy count.
-        if people > 0:
-            if total_seats <= 0:
-                total_seats = max(int(people), 1)
-            occupied = min(int(people), int(total_seats))
-            empty = max(int(total_seats) - occupied, 0)
+        if people > 0 and total_seats > 0:
+            if occupied > people and occupied > 0:
+                occupied = min(people, total_seats)
+            elif occupied + empty > total_seats:
+                overspill = occupied + empty - total_seats
+                occupied = max(0, occupied - overspill)
+            elif occupied == 0 and (empty == total_seats or empty == 0):
+                occupied = min(people, total_seats)
+            empty = max(total_seats - occupied, 0)
         elif not seat_total:
             total_seats = max(int(total_seats or 0), int(people))
             occupied = min(people, total_seats)
@@ -338,9 +395,52 @@ class VisionEngine:
         visible_total = max((occupied + empty), 1) if (occupied + empty) > 0 else max(int(total_seats or 0), 1)
         occupancy_pct = round((occupied / visible_total) * 100, 1) if visible_total else 0.0
         self.latest = FrameResult(people_count=people, occupied_seats=occupied, empty_seats=empty, occupancy_percentage=occupancy_pct, entries=max(delta, 0), exits=max(-delta, 0), mode="roboflow-seat" if self.roboflow_seat_model and not self.seat_model else ("yolo-seat" if self.seat_model else "yolo"), annotated_image=annotated_image)
+        self._cache_frame(frame, annotated_image)
         return self.latest
 
+    def _cache_frame(self, frame: Any, annotated_image: str | None = None) -> None:
+        if cv2 is None:
+            return
+        if annotated_image:
+            frame_bytes = base64.b64decode(annotated_image)
+        else:
+            success, encoded = cv2.imencode(".jpg", frame)
+            if not success:
+                return
+            frame_bytes = encoded.tobytes()
+        with self.frame_lock:
+            self.latest_frame = frame_bytes
+            self.last_frame_at = datetime.now(timezone.utc).isoformat()
+
     def detect_seats(self, frame: Any, person_results: Any) -> tuple[int, int, int]:
+        if self.seat_model is not None:
+            detections = self._predict_detections(self.seat_model, frame, list(self.seat_model.names), SEAT_CONFIDENCE)
+            detections = [detection for detection in detections if self._is_seat_region(detection, frame.shape[0])]
+            if not detections:
+                self.last_annotated_image = None
+            else:
+                self.last_annotated_image = self._annotate_local_detections(frame, detections, self.seat_model.names)
+                class_ids = [detection["class_id"] for detection in detections]
+                names = self.seat_model.names
+                occupied_ids = {
+                    class_id for class_id, name in names.items()
+                    if any(label in str(name).lower() for label in ("occupied", "guest", "person"))
+                }
+                empty_ids = {
+                    class_id for class_id, name in names.items()
+                    if any(label in str(name).lower() for label in ("empty", "available", "vacant"))
+                }
+                occupied = sum(class_id in occupied_ids for class_id in class_ids)
+                empty = sum(class_id in empty_ids for class_id in class_ids)
+                if not occupied_ids and not empty_ids and person_results:
+                    occupied = min(len(person_results), len(class_ids))
+                    empty = max(len(class_ids) - occupied, 0)
+                    return len(class_ids), occupied, empty
+                if not occupied_ids:
+                    occupied = sum(class_id in {1, 2} for class_id in class_ids)
+                if not empty_ids:
+                    empty = max(len(class_ids) - occupied, 0)
+                return len(class_ids), occupied, empty
         if self.roboflow_seat_model:
             detections = self._predict_roboflow_seats(frame)
             detections = [detection for detection in detections if self._is_seat_region(detection, frame.shape[0])]
@@ -351,33 +451,6 @@ class VisionEngine:
             
             if detections:
                 return len(detections), occupied, empty
-        if self.seat_model is not None:
-            detections = self._predict_detections(self.seat_model, frame, list(self.seat_model.names), SEAT_CONFIDENCE)
-            detections = [detection for detection in detections if self._is_seat_region(detection, frame.shape[0])]
-            if not detections:
-                return 0, 0, 0
-            self.last_annotated_image = self._annotate_local_detections(frame, detections, self.seat_model.names)
-            class_ids = [detection["class_id"] for detection in detections]
-            names = self.seat_model.names
-            occupied_ids = {
-                class_id for class_id, name in names.items()
-                if any(label in str(name).lower() for label in ("occupied", "guest", "person"))
-            }
-            empty_ids = {
-                class_id for class_id, name in names.items()
-                if any(label in str(name).lower() for label in ("empty", "available", "vacant"))
-            }
-            occupied = sum(class_id in occupied_ids for class_id in class_ids)
-            empty = sum(class_id in empty_ids for class_id in class_ids)
-            if not occupied_ids and not empty_ids and person_results:
-                occupied = min(len(person_results), len(class_ids))
-                empty = max(len(class_ids) - occupied, 0)
-                return len(class_ids), occupied, empty
-            if not occupied_ids:
-                occupied = sum(class_id in {1, 2} for class_id in class_ids)
-            if not empty_ids:
-                empty = max(len(class_ids) - occupied, 0)
-            return len(class_ids), occupied, empty
         if self.seats:
             occupied = self.seat_count(frame, person_results)
             return len(self.seats), occupied, max(len(self.seats) - occupied, 0)
@@ -409,29 +482,124 @@ class VisionEngine:
         if self.capture_thread and self.capture_thread.is_alive():
             return
         self.stop_event.clear()
+        self.camera_status = "connecting"
+        self.camera_error = None
         self.capture_thread = threading.Thread(target=self.stream_loop, daemon=True)
         self.capture_thread.start()
 
     def stream_loop(self):
         if cv2 is None:
-            return
-        source: int | str = int(SOURCE) if SOURCE.isdigit() else SOURCE
-        capture = cv2.VideoCapture(source)
-        if not capture.isOpened():
-            self.stop_event.set()
+            self.camera_status = "opencv_unavailable"
+            self.camera_error = "OpenCV is not installed."
             return
         while not self.stop_event.is_set():
-            success, frame = capture.read()
-            if success:
+            try:
+                if self.is_http_source():
+                    self.capture_http_mjpeg()
+                else:
+                    self.capture_video_source()
+            except HTTPError as error:
+                if error.code == 401:
+                    self.camera_status = "authentication_failed"
+                    self.camera_error = "Camera authentication failed. Check the configured username and password."
+                elif error.code == 404:
+                    self.camera_status = "endpoint_not_found"
+                    self.camera_error = "The configured camera stream path was not found."
+                else:
+                    self.camera_status = "reconnecting"
+                    self.camera_error = f"Camera endpoint returned HTTP {error.code}."
+            except URLError:
+                self.camera_status = "reconnecting"
+                self.camera_error = "Unable to reach the configured camera stream."
+            except (OSError, TimeoutError):
+                self.camera_status = "reconnecting"
+                self.camera_error = "The camera stream stopped responding."
+            if not self.stop_event.is_set():
+                self.reconnect_attempts += 1
+                time.sleep(5)
+        self.camera_status = "stopped"
+
+    @staticmethod
+    def is_http_source() -> bool:
+        return isinstance(SOURCE, str) and urlsplit(SOURCE).scheme.lower() in {"http", "https"}
+
+    @staticmethod
+    def iter_mjpeg_frames(stream: Any, stop_event: threading.Event):
+        buffer = bytearray()
+        while not stop_event.is_set():
+            chunk = stream.read(4096)
+            if not chunk:
+                return
+            buffer.extend(chunk)
+            while True:
+                start = buffer.find(b"\xff\xd8")
+                if start < 0:
+                    if len(buffer) > 1:
+                        del buffer[:-1]
+                    break
+                if start:
+                    del buffer[:start]
+                end = buffer.find(b"\xff\xd9", 2)
+                if end < 0:
+                    if len(buffer) > 16 * 1024 * 1024:
+                        raise OSError("Camera returned an oversized MJPEG frame.")
+                    break
+                yield bytes(buffer[:end + 2])
+                del buffer[:end + 2]
+
+    def capture_http_mjpeg(self):
+        credentials = HTTPPasswordMgrWithDefaultRealm()
+        credentials.add_password(
+            None,
+            SOURCE,
+            os.getenv("CAMERA_USERNAME", ""),
+            os.getenv("CAMERA_PASSWORD", ""),
+        )
+        opener = build_opener(HTTPDigestAuthHandler(credentials))
+        camera_request = Request(
+            SOURCE,
+            headers={"Accept": "multipart/x-mixed-replace", "User-Agent": "SmartLibCamera/1.0"},
+        )
+        with opener.open(camera_request, timeout=10) as response:
+            if not response.headers.get_content_type().startswith("multipart/"):
+                self.camera_status = "unsupported_stream_format"
+                self.camera_error = "The camera endpoint did not return an MJPEG multipart stream."
+                return
+            self.camera_status = "connected"
+            self.camera_error = None
+            for jpeg_frame in self.iter_mjpeg_frames(response, self.stop_event):
+                frame = cv2.imdecode(np.frombuffer(jpeg_frame, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if frame is not None:
+                    self.process(frame)
+            if not self.stop_event.is_set():
+                self.camera_status = "reconnecting"
+                self.camera_error = "The camera stream ended before the connection was stopped."
+
+    def capture_video_source(self):
+        capture = cv2.VideoCapture(SOURCE)
+        try:
+            if not capture.isOpened():
+                raise OSError("The configured camera stream could not be opened.")
+            self.camera_status = "connected"
+            self.camera_error = None
+            while not self.stop_event.is_set():
+                success, frame = capture.read()
+                if not success:
+                    return
                 self.process(frame)
-            else:
-                time.sleep(0.25)
-        capture.release()
+        finally:
+            capture.release()
 
     def stop_stream(self):
         self.stop_event.set()
+        self.camera_status = "stopped"
 
 engine = VisionEngine()
+
+@app.on_event("startup")
+def start_configured_stream():
+    if SOURCE != "0":
+        engine.start_stream()
 
 @app.get("/ai/health")
 def health():
@@ -442,10 +610,39 @@ def health():
 def occupancy():
     return engine.latest
 
+
+@app.get("/ai/camera/status")
+def camera_status():
+    return {
+        "status": engine.camera_status,
+        "stream_running": bool(engine.capture_thread and engine.capture_thread.is_alive()),
+        "last_frame_at": engine.last_frame_at,
+        "reconnect_attempts": engine.reconnect_attempts,
+        "error": engine.camera_error,
+    }
+
+
+@app.get("/ai/stream.mjpeg")
+def camera_stream():
+    def frame_generator():
+        while not engine.stop_event.is_set():
+            with engine.frame_lock:
+                frame = engine.latest_frame
+            if frame:
+                yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n"
+            time.sleep(0.1)
+
+    return StreamingResponse(
+        frame_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-cache, no-store", "Pragma": "no-cache"},
+    )
+
+
 @app.post("/ai/stream/start")
 def start_stream():
     engine.start_stream()
-    return {"status": "started", "source": "configured server-side stream"}
+    return {"status": "started"}
 
 @app.post("/ai/stream/stop")
 def stop_stream():

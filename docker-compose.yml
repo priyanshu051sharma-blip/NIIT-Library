@@ -26,14 +26,22 @@ services:
       SEAT_MODEL: /models/chair.pt
       FALLBACK_MODEL: /models/yolo11n.pt
       SEAT_CONFIG: /config/cameras.example.json
-      VIDEO_SOURCE: "0"
       TOTAL_SEATS: 70
       TILE_INFERENCE: "true"
       TILE_OVERLAP: "0.15"
       GENERIC_SEAT_FALLBACK: "true"
       GENERIC_CONFIDENCE: "0.2"
       GENERIC_INFERENCE_SIZE: 1280
-      ROBOFLOW_API_KEY: ${ROBOFLOW_API_KEY:-MauBf5CLvmmWiaPUqRzL}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3001}
+      VIDEO_SOURCE: ${VIDEO_SOURCE:-0}
+      CAMERA_STREAM_URL: ${CAMERA_STREAM_URL:-}
+      CAMERA_HOST: ${CAMERA_HOST:-}
+      CAMERA_PORT: ${CAMERA_PORT:-80}
+      CAMERA_PROTOCOL: ${CAMERA_PROTOCOL:-http}
+      CAMERA_STREAM_PATH: ${CAMERA_STREAM_PATH:-/cgi-bin/mjpg/video.cgi}
+      CAMERA_USERNAME: ${CAMERA_USERNAME:-}
+      CAMERA_PASSWORD: ${CAMERA_PASSWORD:-}
+      ROBOFLOW_API_KEY: ${ROBOFLOW_API_KEY:-}
       ROBOFLOW_MODEL_ID: ${ROBOFLOW_MODEL_ID:-chair-occupancy-detection-2/3}
       ROBOFLOW_WORKSPACE: ${ROBOFLOW_WORKSPACE:-khushi-kathuria}
       ROBOFLOW_WORKFLOW_ID: ${ROBOFLOW_WORKFLOW_ID:-general-segmentation-api-3}
@@ -43,13 +51,14 @@ services:
       - ./ai-service/runs/smartlib-seat-states/weights/best.pt:/models/chair.pt:ro
       - ./yolo11n.pt:/models/yolo11n.pt:ro
       - ./config/cameras.example.json:/config/cameras.example.json:ro
-    ports: ["8001:8001"]
+    ports: ["127.0.0.1:8001:8001"]
   frontend:
     build: ./frontend
     ports: ["3001:3001"]
     environment:
       PORT: "3001"
       NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_AI_SERVICE_URL: http://localhost:8001
     depends_on: [backend]
 volumes:
   smartlib-postgres:
