@@ -3,20 +3,21 @@ from __future__ import annotations
 import os
 import json
 import base64
+import math
 import threading
 import time
 from pathlib import Path
 from typing import Any
 from datetime import datetime, timezone
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPDigestAuthHandler, HTTPPasswordMgrWithDefaultRealm, Request, build_opener
 
 import numpy as np
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from fastapi.responses import StreamingResponse
 
 try:
@@ -32,7 +33,7 @@ app = FastAPI(title="SmartLib AI Vision Service", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3001").split(","),
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
 MODEL_PATH = os.getenv("PERSON_MODEL", "yolo11n.pt")
@@ -73,6 +74,54 @@ def configured_video_source() -> int | str:
 
 
 SOURCE = configured_video_source()
+CAMERA_NAMES = {
+    1: "Library-1",
+    2: "Library-2",
+    3: "Library-3",
+    4: "Library-4",
+    5: "Library Main",
+    6: "Cabin-1",
+    7: "Cabin-2",
+}
+
+
+def parse_camera_channels(value: str) -> tuple[int, ...]:
+    try:
+        channels = tuple(dict.fromkeys(int(channel.strip()) for channel in value.split(",") if channel.strip()))
+    except ValueError as error:
+        raise ValueError("CAMERA_CHANNELS must be a comma-separated list of positive integers.") from error
+    if not channels or any(channel < 1 for channel in channels):
+        raise ValueError("CAMERA_CHANNELS must contain at least one positive channel number.")
+    return channels
+
+
+def configured_camera_sources(source: int | str, channels: tuple[int, ...]) -> list[dict[str, Any]]:
+    if not isinstance(source, str) or source == "0":
+        return []
+
+    parsed = urlsplit(source)
+    if parsed.scheme.lower() != "rtsp":
+        return [{"id": "camera-1", "name": "Camera 1", "channel": None, "source": source}]
+
+    sources = []
+    for channel in channels:
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+        channel_parameter = next((index for index, (key, _) in enumerate(query) if key == "channel"), None)
+        if channel_parameter is None:
+            query.append(("channel", str(channel)))
+        else:
+            query[channel_parameter] = ("channel", str(channel))
+        camera_source = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
+        sources.append({
+            "id": f"cam-{channel}",
+            "name": CAMERA_NAMES.get(channel, f"Camera {channel}"),
+            "channel": channel,
+            "source": camera_source,
+        })
+    return sources
+
+
+CAMERA_CHANNELS = parse_camera_channels(os.getenv("CAMERA_CHANNELS", "1,2,3,4,5,6,7"))
 SEAT_CONFIDENCE = float(os.getenv("SEAT_CONFIDENCE", "0.15"))
 PERSON_CONFIDENCE = float(os.getenv("PERSON_CONFIDENCE", "0.25"))
 GENERIC_CONFIDENCE = float(os.getenv("GENERIC_CONFIDENCE", "0.2"))
@@ -104,6 +153,21 @@ class FrameResult(BaseModel):
     privacy: str = "No biometric identification is performed."
     annotated_image: str | None = None
 
+
+class CameraCalibration(BaseModel):
+    points: list[tuple[float, float]] = Field(min_length=3, max_length=64)
+
+    @field_validator("points")
+    @classmethod
+    def validate_points(cls, points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        if any(
+            not math.isfinite(x) or not math.isfinite(y) or not 0 <= x <= 1 or not 0 <= y <= 1
+            for x, y in points
+        ):
+            raise ValueError("ROI coordinates must be finite normalized values between 0 and 1.")
+        return points
+
+
 class VisionEngine:
     def __init__(self):
         self.person_model = None
@@ -113,6 +177,7 @@ class VisionEngine:
         self.roboflow_workflow = bool(ROBOFLOW_API_KEY and ROBOFLOW_WORKSPACE and ROBOFLOW_WORKFLOW_ID)
         self.roboflow_client = None
         self.last_annotated_image = None
+        self._processing_lock = threading.Lock()
         if self.roboflow_seat_model and InferenceHTTPClient is not None:
             client = InferenceHTTPClient(
                 api_url=ROBOFLOW_API_URL,
@@ -138,10 +203,14 @@ class VisionEngine:
         self.latest = self.mock_result()
         if YOLO and os.getenv("AI_MODE", "mock") == "real":
             person_path = Path(MODEL_PATH)
+            fallback_path = Path(FALLBACK_MODEL_PATH) if FALLBACK_MODEL_PATH else None
+            if fallback_path and fallback_path.exists():
+                self.fallback_model = YOLO(str(fallback_path))
             if person_path.exists():
-                self.person_model = YOLO(str(person_path))
-            if FALLBACK_MODEL_PATH and Path(FALLBACK_MODEL_PATH).exists():
-                self.fallback_model = YOLO(FALLBACK_MODEL_PATH)
+                if fallback_path and person_path.resolve() == fallback_path.resolve():
+                    self.person_model = self.fallback_model
+                else:
+                    self.person_model = YOLO(str(person_path))
             if SEAT_MODEL_PATH and Path(SEAT_MODEL_PATH).exists():
                 self.seat_model = YOLO(SEAT_MODEL_PATH)
                 self.roboflow_seat_model = False
@@ -265,8 +334,22 @@ class VisionEngine:
             return base64.b64encode(encoded.tobytes()).decode("utf-8")
         return ""
 
-    def _annotate_local_detections(self, frame: Any, detections: list[dict[str, Any]], names: dict[int, str]) -> str:
-        annotated = frame.copy()
+    def _annotate_local_detections(
+        self,
+        frame: Any,
+        detections: list[dict[str, Any]],
+        names: dict[int, str],
+        base_image: str | None = None,
+    ) -> str:
+        if base_image:
+            annotated = cv2.imdecode(
+                np.frombuffer(base64.b64decode(base_image), dtype=np.uint8),
+                cv2.IMREAD_COLOR,
+            )
+            if annotated is None:
+                raise ValueError("Could not decode the existing detection overlay.")
+        else:
+            annotated = frame.copy()
         for detection in detections:
             x1, y1, x2, y2 = map(int, detection["bbox"])
             class_id = detection["class_id"]
@@ -296,12 +379,62 @@ class VisionEngine:
         second_area = max(0, second[2] - second[0]) * max(0, second[3] - second[1])
         return intersection / max(first_area + second_area - intersection, 1)
 
+    @classmethod
+    def _merge_detections(cls, *batches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        detections = sorted(
+            (detection for batch in batches for detection in batch),
+            key=lambda detection: detection["confidence"],
+            reverse=True,
+        )
+        merged: list[dict[str, Any]] = []
+        for detection in detections:
+            if all(
+                cls._iou(detection["bbox"], existing["bbox"]) < 0.5
+                for existing in merged
+            ):
+                merged.append(detection)
+        return merged
+
     @staticmethod
     def _is_seat_region(detection: dict[str, Any], frame_height: int) -> bool:
         left, top, right, bottom = detection["bbox"]
         center_y = (top + bottom) / 2
         box_height = max(bottom - top, 0)
         return top >= frame_height * 0.48 and center_y >= frame_height * 0.55 and bottom >= frame_height * 0.62 and box_height >= frame_height * 0.06
+
+    @staticmethod
+    def _detection_in_seat_roi(
+        detection: dict[str, Any],
+        frame_shape: tuple[int, ...],
+        seat_roi: list[tuple[float, float]] | None,
+    ) -> bool:
+        if not seat_roi:
+            return True
+        height, width = frame_shape[:2]
+        left, top, right, bottom = detection["bbox"]
+        center = ((left + right) / (2 * width), (top + bottom) / (2 * height))
+        polygon = np.array(seat_roi, dtype=np.float32)
+        return cv2.pointPolygonTest(polygon, center, False) >= 0
+
+    @staticmethod
+    def _seat_in_seat_roi(
+        seat: dict[str, Any],
+        frame_shape: tuple[int, ...],
+        seat_roi: list[tuple[float, float]],
+    ) -> bool:
+        coordinates = seat.get("coordinates", [])
+        if len(coordinates) < 3:
+            return False
+        height, width = frame_shape[:2]
+        normalized = all(0 <= point[0] <= 1 and 0 <= point[1] <= 1 for point in coordinates)
+        x_scale = width if normalized else 1
+        y_scale = height if normalized else 1
+        left = min(point[0] * x_scale for point in coordinates)
+        top = min(point[1] * y_scale for point in coordinates)
+        right = max(point[0] * x_scale for point in coordinates)
+        bottom = max(point[1] * y_scale for point in coordinates)
+        detection = {"bbox": [left, top, right, bottom]}
+        return VisionEngine._detection_in_seat_roi(detection, frame_shape, seat_roi)
 
     def _predict_detections(self, model: Any, frame: Any, classes: list[int], confidence: float, tiled: bool | None = None, imgsz: int = 640) -> list[dict[str, Any]]:
         height, width = frame.shape[:2]
@@ -343,7 +476,19 @@ class VisionEngine:
                 kept.append(detection)
         return kept
 
-    def process(self, frame: Any = None) -> FrameResult:
+    def process(
+        self,
+        frame: Any = None,
+        seat_roi: list[tuple[float, float]] | None = None,
+    ) -> FrameResult:
+        with self._processing_lock:
+            return self._process_frame(frame, seat_roi)
+
+    def _process_frame(
+        self,
+        frame: Any = None,
+        seat_roi: list[tuple[float, float]] | None = None,
+    ) -> FrameResult:
         if frame is None:
             return self.mock_result()
         self.last_annotated_image = None
@@ -351,26 +496,63 @@ class VisionEngine:
             self._cache_frame(frame)
             return self.mock_result()
         detector = self.person_model or self.fallback_model
-        person_detections = self._predict_detections(detector, frame, [0], PERSON_CONFIDENCE) if detector else []
+        generic_people_detections: list[dict[str, Any]] = []
+        generic_chair_detections: list[dict[str, Any]] = []
+        if GENERIC_SEAT_FALLBACK and self.fallback_model is not None:
+            generic_predictions = self._predict_detections(
+                self.fallback_model,
+                frame,
+                [0, 56],
+                min(PERSON_CONFIDENCE, GENERIC_CONFIDENCE),
+                tiled=False,
+                imgsz=GENERIC_INFERENCE_SIZE,
+            )
+            generic_people_detections = [
+                detection for detection in generic_predictions
+                if detection["class_id"] == 0
+                and detection["confidence"] >= PERSON_CONFIDENCE
+            ]
+            generic_chair_detections = [
+                detection for detection in generic_predictions
+                if detection["class_id"] == 56
+            ]
+        if detector is self.fallback_model and GENERIC_SEAT_FALLBACK:
+            person_detections = generic_people_detections
+        else:
+            person_detections = self._predict_detections(detector, frame, [0], PERSON_CONFIDENCE) if detector else []
+        if GENERIC_SEAT_FALLBACK and self.fallback_model is not detector:
+            person_detections = self._merge_detections(
+                person_detections,
+                generic_people_detections,
+            )
         people = len(person_detections)
+        if seat_roi is None:
+            seat_total, occupied, empty = self.detect_seats(frame, person_detections)
+        else:
+            seat_total, occupied, empty = self.detect_seats(frame, person_detections, seat_roi)
         generic_detections = []
         if GENERIC_SEAT_FALLBACK and self.fallback_model is not None:
-            generic_people_detections = self._predict_detections(self.fallback_model, frame, [0], GENERIC_CONFIDENCE, tiled=False, imgsz=GENERIC_INFERENCE_SIZE)
-            generic_chair_detections = self._predict_detections(self.fallback_model, frame, [56], GENERIC_CONFIDENCE, tiled=False, imgsz=GENERIC_INFERENCE_SIZE)
-            generic_chair_detections = [detection for detection in generic_chair_detections if self._is_seat_region(detection, frame.shape[0])]
+            generic_chair_detections = [
+                detection for detection in generic_chair_detections
+                if (
+                    self._detection_in_seat_roi(detection, frame.shape[:2], seat_roi)
+                    if seat_roi is not None
+                    else self._is_seat_region(detection, frame.shape[0])
+                )
+            ]
             generic_detections = generic_people_detections + generic_chair_detections
-            generic_people = len(generic_people_detections)
-            if generic_people:
-                people = generic_people
             if generic_detections:
-                self.last_annotated_image = self._annotate_local_detections(frame, generic_detections, self.fallback_model.names)
-        seat_total, occupied, empty = self.detect_seats(frame, person_detections)
+                self.last_annotated_image = self._annotate_local_detections(
+                    frame,
+                    person_detections + generic_chair_detections,
+                    self.fallback_model.names,
+                    base_image=self.last_annotated_image,
+                )
         generic_chairs = sum(detection["class_id"] == 56 for detection in generic_detections)
-        if GENERIC_SEAT_FALLBACK and generic_chairs and seat_total < generic_chairs * 0.5:
+        if GENERIC_SEAT_FALLBACK and generic_chairs > seat_total:
             seat_total = generic_chairs
-            occupied = min(people, seat_total)
-            empty = seat_total - occupied
-        total_seats = seat_total or self.total_seats
+            empty = max(seat_total - occupied, 0)
+        total_seats = seat_total if seat_roi is not None else seat_total or self.total_seats
         if people > 0 and total_seats > 0:
             if occupied > people and occupied > 0:
                 occupied = min(people, total_seats)
@@ -412,10 +594,18 @@ class VisionEngine:
             self.latest_frame = frame_bytes
             self.last_frame_at = datetime.now(timezone.utc).isoformat()
 
-    def detect_seats(self, frame: Any, person_results: Any) -> tuple[int, int, int]:
+    def detect_seats(
+        self,
+        frame: Any,
+        person_results: Any,
+        seat_roi: list[tuple[float, float]] | None = None,
+    ) -> tuple[int, int, int]:
         if self.seat_model is not None:
             detections = self._predict_detections(self.seat_model, frame, list(self.seat_model.names), SEAT_CONFIDENCE)
-            detections = [detection for detection in detections if self._is_seat_region(detection, frame.shape[0])]
+            detections = [
+                detection for detection in detections
+                if self._detection_in_seat_roi(detection, frame.shape[:2], seat_roi)
+            ]
             if not detections:
                 self.last_annotated_image = None
             else:
@@ -443,28 +633,46 @@ class VisionEngine:
                 return len(class_ids), occupied, empty
         if self.roboflow_seat_model:
             detections = self._predict_roboflow_seats(frame)
-            detections = [detection for detection in detections if self._is_seat_region(detection, frame.shape[0])]
+            detections = [
+                detection for detection in detections
+                if self._is_seat_region(detection, frame.shape[0])
+                and self._detection_in_seat_roi(detection, frame.shape[:2], seat_roi)
+            ]
             occupied = sum("occupied" in detection["class_name"] or "guest" in detection["class_name"] for detection in detections)
             empty = sum("empty" in detection["class_name"] or "available" in detection["class_name"] or "vacant" in detection["class_name"] for detection in detections)
             
-            self.last_annotated_image = self._annotate_roboflow_seats(frame, detections)
+            self.last_annotated_image = self._annotate_roboflow_seats(frame, detections) if detections else None
             
             if detections:
                 return len(detections), occupied, empty
         if self.seats:
-            occupied = self.seat_count(frame, person_results)
-            return len(self.seats), occupied, max(len(self.seats) - occupied, 0)
+            configured_seats = self.seats
+            if seat_roi is not None:
+                configured_seats = [
+                    seat for seat in self.seats
+                    if self._seat_in_seat_roi(seat, frame.shape[:2], seat_roi)
+                ]
+            if configured_seats:
+                occupied = self.seat_count(frame, person_results, configured_seats)
+                return len(configured_seats), occupied, max(len(configured_seats) - occupied, 0)
+        if seat_roi is not None:
+            return 0, 0, 0
         occupied = min(len(person_results), self.total_seats)
         return self.total_seats, occupied, max(self.total_seats - occupied, 0)
 
-    def seat_count(self, frame: Any, results: Any) -> int:
+    def seat_count(
+        self,
+        frame: Any,
+        results: Any,
+        seats: list[dict[str, Any]] | None = None,
+    ) -> int:
         height, width = frame.shape[:2]
         person_points = []
         boxes = [detection["bbox"] for detection in results]
         for left, top, right, bottom in boxes:
             person_points.append((int((left + right) / 2), int(bottom)))
         occupied = 0
-        for seat in self.seats:
+        for seat in self.seats if seats is None else seats:
             coordinates = seat.get("coordinates", [])
             normalized = all(0 <= point[0] <= 1 and 0 <= point[1] <= 1 for point in coordinates)
             polygon = [(int(point[0] * width), int(point[1] * height)) if normalized else (int(point[0]), int(point[1])) for point in coordinates]
@@ -526,8 +734,9 @@ class VisionEngine:
     @staticmethod
     def iter_mjpeg_frames(stream: Any, stop_event: threading.Event):
         buffer = bytearray()
+        read_chunk = getattr(stream, "read1", None) or stream.read
         while not stop_event.is_set():
-            chunk = stream.read(4096)
+            chunk = read_chunk(4096)
             if not chunk:
                 return
             buffer.extend(chunk)
@@ -594,25 +803,366 @@ class VisionEngine:
         self.stop_event.set()
         self.camera_status = "stopped"
 
+class CameraFeed:
+    def __init__(self, camera: dict[str, Any]):
+        self.id = camera["id"]
+        self.name = camera["name"]
+        self.channel = camera["channel"]
+        self.source = camera["source"]
+        self.lifecycle_lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.condition = threading.Condition()
+        self.capture_thread: threading.Thread | None = None
+        self.latest_raw_frame: Any = None
+        self.latest_raw_sequence = 0
+        self.latest_source_frame: bytes | None = None
+        self.source_sequence = 0
+        self.latest_annotated_frame: bytes | None = None
+        self.annotated_sequence = 0
+        self.latest = FrameResult(mode="waiting")
+        self.seat_roi: list[tuple[float, float]] | None = None
+        self.status = "connecting"
+        self.error: str | None = None
+        self.last_frame_at: str | None = None
+        self.last_detection_at: str | None = None
+        self.reconnect_attempts = 0
+        self.previous_people: int | None = None
+
+    @staticmethod
+    def _encode_preview(frame: Any, max_width: int, quality: int) -> bytes | None:
+        height, width = frame.shape[:2]
+        if width > max_width:
+            resized_height = max(1, round(height * max_width / width))
+            frame = cv2.resize(frame, (max_width, resized_height), interpolation=cv2.INTER_AREA)
+        success, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        return encoded.tobytes() if success else None
+
+    def start(self) -> None:
+        with self.lifecycle_lock:
+            if self.capture_thread and self.capture_thread.is_alive():
+                if not self.stop_event.is_set():
+                    return
+                self.capture_thread.join(timeout=15)
+                if self.capture_thread.is_alive():
+                    raise RuntimeError(f"Previous capture for {self.name} has not stopped.")
+            self.stop_event = threading.Event()
+            self.status = "connecting"
+            self.error = None
+            self.capture_thread = threading.Thread(
+                target=self._capture_loop,
+                args=(self.stop_event,),
+                daemon=True,
+                name=f"camera-{self.id}",
+            )
+            self.capture_thread.start()
+
+    def _capture_loop(self, stop_event: threading.Event) -> None:
+        if cv2 is None:
+            self.status = "opencv_unavailable"
+            self.error = "OpenCV is not installed."
+            return
+
+        while not stop_event.is_set():
+            capture = None
+            try:
+                if isinstance(self.source, int):
+                    capture = cv2.VideoCapture(self.source)
+                else:
+                    capture = cv2.VideoCapture(
+                        self.source,
+                        cv2.CAP_FFMPEG,
+                        [
+                            cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000,
+                            cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000,
+                        ],
+                    )
+                    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                if not capture.isOpened():
+                    raise OSError("The configured camera stream could not be opened.")
+
+                next_preview_at = 0.0
+                while not stop_event.is_set():
+                    success, frame = capture.read()
+                    if not success:
+                        raise OSError("The camera stream stopped responding.")
+                    self.status = "connected"
+                    self.error = None
+                    now = time.monotonic()
+                    with self.condition:
+                        self.latest_raw_frame = frame
+                        self.latest_raw_sequence += 1
+                        self.last_frame_at = datetime.now(timezone.utc).isoformat()
+                    if now >= next_preview_at:
+                        preview = self._encode_preview(frame, max_width=720, quality=68)
+                        if preview:
+                            with self.condition:
+                                self.latest_source_frame = preview
+                                self.source_sequence += 1
+                                self.condition.notify_all()
+                        next_preview_at = now + 0.25
+            except (OSError, TimeoutError, cv2.error) as error:
+                if not stop_event.is_set():
+                    self.status = "reconnecting"
+                    self.error = f"Camera capture failed: {type(error).__name__}."
+            finally:
+                if capture is not None:
+                    capture.release()
+            if not stop_event.is_set():
+                self.reconnect_attempts += 1
+                stop_event.wait(3)
+        self.status = "stopped"
+        with self.condition:
+            self.condition.notify_all()
+
+    def raw_snapshot(self) -> tuple[int, Any]:
+        with self.condition:
+            return self.latest_raw_sequence, self.latest_raw_frame
+
+    def publish_detection(self, sequence: int, frame: Any, result: FrameResult) -> None:
+        people = result.people_count
+        previous_people = people if self.previous_people is None else self.previous_people
+        self.previous_people = people
+        result = result.model_copy(update={
+            "entries": max(people - previous_people, 0),
+            "exits": max(previous_people - people, 0),
+        })
+        annotated = cv2.imdecode(
+            np.frombuffer(base64.b64decode(result.annotated_image), dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        ) if result.annotated_image else frame
+        encoded = self._encode_preview(annotated, max_width=960, quality=78)
+        with self.condition:
+            self.latest = result
+            self.latest_annotated_frame = encoded
+            self.annotated_sequence += 1
+            self.last_detection_at = datetime.now(timezone.utc).isoformat()
+            self.condition.notify_all()
+
+    def record_inference_error(self, error: Exception) -> None:
+        with self.condition:
+            self.error = f"Frame inference failed: {type(error).__name__}."
+
+    def public_state(self) -> dict[str, Any]:
+        with self.condition:
+            return {
+                "id": self.id,
+                "name": self.name,
+                "channel": self.channel,
+                "status": self.status,
+                "stream_running": bool(self.capture_thread and self.capture_thread.is_alive()),
+                "last_frame_at": self.last_frame_at,
+                "last_detection_at": self.last_detection_at,
+                "reconnect_attempts": self.reconnect_attempts,
+                "error": self.error,
+                "seat_roi": self.seat_roi,
+                "calibrated": self.seat_roi is not None,
+                "occupancy": self.latest.model_dump(exclude={"annotated_image"}),
+            }
+
+    def stream(self, annotated: bool):
+        stop_event = self.stop_event
+        sequence = -1
+        while not stop_event.is_set():
+            with self.condition:
+                image_sequence = self.annotated_sequence if annotated else self.source_sequence
+                image = self.latest_annotated_frame if annotated else self.latest_source_frame
+                if image is None or image_sequence == sequence:
+                    self.condition.wait(timeout=1)
+                    image_sequence = self.annotated_sequence if annotated else self.source_sequence
+                    image = self.latest_annotated_frame if annotated else self.latest_source_frame
+            if image and image_sequence != sequence:
+                sequence = image_sequence
+                yield (
+                    b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                    + str(len(image)).encode()
+                    + b"\r\n\r\n"
+                    + image
+                    + b"\r\n"
+                )
+
+
+class CameraMonitor:
+    def __init__(
+        self,
+        vision_engine: VisionEngine,
+        cameras: list[dict[str, Any]],
+        calibration_path: str | Path | None = None,
+    ):
+        self.engine = vision_engine
+        self.feeds = {camera["id"]: CameraFeed(camera) for camera in cameras}
+        self.default_camera_id = "cam-2" if "cam-2" in self.feeds else next(iter(self.feeds), None)
+        self.lifecycle_lock = threading.Lock()
+        self.calibration_lock = threading.Lock()
+        self.calibration_path = Path(
+            calibration_path or os.getenv("CAMERA_CALIBRATION_PATH", "/data/seat-areas.json")
+        )
+        self.stop_event = threading.Event()
+        self.inference_thread: threading.Thread | None = None
+        self._load_calibrations()
+
+    def _load_calibrations(self) -> None:
+        if not self.calibration_path.exists():
+            return
+        try:
+            calibrations = json.loads(self.calibration_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError("Could not read persisted camera seat-area calibrations.") from error
+        if not isinstance(calibrations, dict):
+            raise RuntimeError("Persisted camera calibrations must be a JSON object.")
+        for camera_id, points in calibrations.items():
+            if camera_id in self.feeds:
+                calibration = CameraCalibration(points=points)
+                self.feeds[camera_id].seat_roi = calibration.points
+
+    def set_calibration(
+        self,
+        feed: CameraFeed,
+        points: list[tuple[float, float]] | None,
+    ) -> None:
+        with self.calibration_lock:
+            calibrations = {
+                camera_id: current_feed.seat_roi
+                for camera_id, current_feed in self.feeds.items()
+                if current_feed.seat_roi is not None and camera_id != feed.id
+            }
+            if points is not None:
+                calibrations[feed.id] = points
+            self.calibration_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path = self.calibration_path.with_name(
+                f"{self.calibration_path.name}.{threading.get_ident()}.tmp"
+            )
+            temporary_path.write_text(json.dumps(calibrations, indent=2), encoding="utf-8")
+            temporary_path.replace(self.calibration_path)
+            with feed.condition:
+                feed.seat_roi = points
+
+    def start(self) -> None:
+        if not self.feeds:
+            return
+        with self.lifecycle_lock:
+            if self.inference_thread and self.inference_thread.is_alive():
+                if not self.stop_event.is_set():
+                    for feed in self.feeds.values():
+                        feed.start()
+                    return
+                self.inference_thread.join(timeout=15)
+                if self.inference_thread.is_alive():
+                    raise RuntimeError("The previous camera inference worker has not stopped.")
+            self.stop_event = threading.Event()
+            for feed in self.feeds.values():
+                feed.start()
+            self.inference_thread = threading.Thread(
+                target=self._inference_loop,
+                args=(self.stop_event,),
+                daemon=True,
+                name="camera-inference",
+            )
+            self.inference_thread.start()
+
+    def _inference_loop(self, stop_event: threading.Event) -> None:
+        processed_sequences = {camera_id: 0 for camera_id in self.feeds}
+        while not stop_event.is_set():
+            processed_any = False
+            for camera_id, feed in self.feeds.items():
+                if stop_event.is_set():
+                    return
+                sequence, frame = feed.raw_snapshot()
+                if frame is None or sequence <= processed_sequences[camera_id]:
+                    continue
+                try:
+                    with feed.condition:
+                        seat_roi = feed.seat_roi
+                    result = self.engine.process(frame, seat_roi=seat_roi)
+                    feed.publish_detection(sequence, frame, result)
+                except Exception as error:
+                    feed.record_inference_error(error)
+                processed_sequences[camera_id] = sequence
+                processed_any = True
+            if not processed_any:
+                stop_event.wait(0.05)
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        for feed in self.feeds.values():
+            feed.stop_event.set()
+            with feed.condition:
+                feed.condition.notify_all()
+
+    def get_feed(self, camera_id: str | None) -> CameraFeed:
+        selected_id = camera_id or self.default_camera_id
+        if selected_id is None or selected_id not in self.feeds:
+            raise HTTPException(status_code=404, detail="Camera not found.")
+        return self.feeds[selected_id]
+
+    def public_state(self) -> list[dict[str, Any]]:
+        return [feed.public_state() for feed in self.feeds.values()]
+
+    def occupancy(self, camera_id: str | None) -> FrameResult:
+        return self.get_feed(camera_id).latest
+
+
 engine = VisionEngine()
+camera_monitor = CameraMonitor(engine, configured_camera_sources(SOURCE, CAMERA_CHANNELS))
+
 
 @app.on_event("startup")
 def start_configured_stream():
-    if SOURCE != "0":
-        engine.start_stream()
+    camera_monitor.start()
+
 
 @app.get("/ai/health")
 def health():
     mode = "roboflow-workflow" if engine.roboflow_workflow else ("roboflow-seat" if engine.roboflow_seat_model else ("yolo" if engine.person_model else "mock"))
-    return {"status": "ok", "mode": mode, "stream_running": bool(engine.capture_thread and engine.capture_thread.is_alive()), "person_model": MODEL_PATH, "seat_model": SEAT_MODEL_PATH or None, "roboflow_model": ROBOFLOW_MODEL_ID if engine.roboflow_seat_model else None, "roboflow_workflow": ROBOFLOW_WORKFLOW_ID if engine.roboflow_workflow else None}
+    active_streams = sum(camera["stream_running"] for camera in camera_monitor.public_state())
+    return {
+        "status": "ok",
+        "mode": mode,
+        "stream_running": active_streams > 0,
+        "camera_count": len(camera_monitor.feeds),
+        "active_cameras": active_streams,
+        "person_model": MODEL_PATH,
+        "seat_model": SEAT_MODEL_PATH or None,
+        "roboflow_model": ROBOFLOW_MODEL_ID if engine.roboflow_seat_model else None,
+        "roboflow_workflow": ROBOFLOW_WORKFLOW_ID if engine.roboflow_workflow else None,
+    }
+
+
+@app.get("/ai/cameras")
+def cameras():
+    return camera_monitor.public_state()
+
+
+@app.put("/ai/cameras/{camera_id}/roi")
+def save_camera_roi(camera_id: str, calibration: CameraCalibration):
+    feed = camera_monitor.get_feed(camera_id)
+    try:
+        camera_monitor.set_calibration(feed, calibration.points)
+    except OSError as error:
+        raise HTTPException(status_code=500, detail="Could not persist the camera seat-area calibration.") from error
+    return {"camera_id": feed.id, "seat_roi": feed.seat_roi, "calibrated": True}
+
+
+@app.delete("/ai/cameras/{camera_id}/roi")
+def clear_camera_roi(camera_id: str):
+    feed = camera_monitor.get_feed(camera_id)
+    try:
+        camera_monitor.set_calibration(feed, None)
+    except OSError as error:
+        raise HTTPException(status_code=500, detail="Could not persist the camera seat-area calibration.") from error
+    return {"camera_id": feed.id, "seat_roi": None, "calibrated": False}
+
 
 @app.get("/ai/occupancy", response_model=FrameResult)
-def occupancy():
+def occupancy(camera_id: str | None = Query(default=None)):
+    if camera_monitor.feeds:
+        return camera_monitor.occupancy(camera_id)
     return engine.latest
 
 
 @app.get("/ai/camera/status")
-def camera_status():
+def camera_status(camera_id: str | None = Query(default=None)):
+    if camera_monitor.feeds:
+        return camera_monitor.get_feed(camera_id).public_state()
     return {
         "status": engine.camera_status,
         "stream_running": bool(engine.capture_thread and engine.capture_thread.is_alive()),
@@ -623,29 +1173,61 @@ def camera_status():
 
 
 @app.get("/ai/stream.mjpeg")
-def camera_stream():
-    def frame_generator():
-        while not engine.stop_event.is_set():
-            with engine.frame_lock:
-                frame = engine.latest_frame
-            if frame:
-                yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n"
-            time.sleep(0.1)
+def camera_stream(
+    camera_id: str | None = Query(default=None),
+    annotated: bool = Query(default=False),
+):
+    if camera_monitor.feeds:
+        feed = camera_monitor.get_feed(camera_id)
+        frame_generator = feed.stream(annotated)
+    else:
+        def frame_generator():
+            while not engine.stop_event.is_set():
+                with engine.frame_lock:
+                    frame = engine.latest_frame
+                if frame:
+                    yield (
+                        b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                        + str(len(frame)).encode()
+                        + b"\r\n\r\n"
+                        + frame
+                        + b"\r\n"
+                    )
+                time.sleep(0.1)
 
     return StreamingResponse(
-        frame_generator(),
+        frame_generator,
         media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-cache, no-store", "Pragma": "no-cache"},
+    )
+
+
+@app.get("/ai/camera/frame.jpg")
+def camera_frame(
+    camera_id: str | None = Query(default=None),
+    annotated: bool = Query(default=False),
+):
+    feed = camera_monitor.get_feed(camera_id)
+    with feed.condition:
+        image = feed.latest_annotated_frame if annotated else feed.latest_source_frame
+    if image is None:
+        raise HTTPException(status_code=503, detail="The selected camera has not produced a frame yet.")
+    return Response(
+        content=image,
+        media_type="image/jpeg",
         headers={"Cache-Control": "no-cache, no-store", "Pragma": "no-cache"},
     )
 
 
 @app.post("/ai/stream/start")
 def start_stream():
-    engine.start_stream()
-    return {"status": "started"}
+    camera_monitor.start()
+    return {"status": "started", "camera_count": len(camera_monitor.feeds)}
+
 
 @app.post("/ai/stream/stop")
 def stop_stream():
+    camera_monitor.stop()
     engine.stop_stream()
     return {"status": "stopped"}
 

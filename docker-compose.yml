@@ -22,7 +22,7 @@ services:
     build: ./ai-service
     environment:
       AI_MODE: real
-      PERSON_MODEL: /models/person.pt
+      PERSON_MODEL: /models/yolo11n.pt
       SEAT_MODEL: /models/chair.pt
       FALLBACK_MODEL: /models/yolo11n.pt
       SEAT_CONFIG: /config/cameras.example.json
@@ -32,6 +32,9 @@ services:
       GENERIC_SEAT_FALLBACK: "true"
       GENERIC_CONFIDENCE: "0.2"
       GENERIC_INFERENCE_SIZE: 1280
+      OPENCV_FFMPEG_CAPTURE_OPTIONS: "rtsp_transport;tcp|stimeout;5000000"
+      CAMERA_CHANNELS: ${CAMERA_CHANNELS:-1,2,3,4,5,6,7}
+      CAMERA_CALIBRATION_PATH: /data/seat-areas.json
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3001}
       VIDEO_SOURCE: ${VIDEO_SOURCE:-0}
       CAMERA_STREAM_URL: ${CAMERA_STREAM_URL:-}
@@ -47,10 +50,10 @@ services:
       ROBOFLOW_WORKFLOW_ID: ${ROBOFLOW_WORKFLOW_ID:-general-segmentation-api-3}
       ROBOFLOW_WORKFLOW_PARAMETERS: ${ROBOFLOW_WORKFLOW_PARAMETERS:-'{"classes":["person","chair","seat","object"]}'}
     volumes:
-      - ./ai-service/runs/smartlib-person-smoke/weights/best.pt:/models/person.pt:ro
       - ./ai-service/runs/smartlib-seat-states/weights/best.pt:/models/chair.pt:ro
       - ./yolo11n.pt:/models/yolo11n.pt:ro
       - ./config/cameras.example.json:/config/cameras.example.json:ro
+      - smartlib-camera-calibration:/data
     ports: ["127.0.0.1:8001:8001"]
   frontend:
     build: ./frontend
@@ -62,3 +65,4 @@ services:
     depends_on: [backend]
 volumes:
   smartlib-postgres:
+  smartlib-camera-calibration:
