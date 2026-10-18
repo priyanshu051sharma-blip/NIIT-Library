@@ -46,13 +46,6 @@ export default function Home() {
     localStorage.setItem("smartlib_token", "demo-student");
     localStorage.setItem("smartlib_role", "STUDENT");
 
-    const defaultSeats = {
-      leftSide: { total: 35, available: 24, occupied: 11, status: "AVAILABLE" },
-      rightSide: { total: 35, available: 18, occupied: 17, status: "AVAILABLE" },
-      lastUpdated: new Date().toISOString(),
-    };
-    localStorage.setItem("smartlib_area_status", JSON.stringify(defaultSeats));
-
     router.push("/student/dashboard");
   };
 
@@ -70,12 +63,12 @@ export default function Home() {
             </p>
             <div style={{ marginTop: 28, display: "flex", gap: 16, flexWrap: "wrap" }}>
               <div style={{ background: "#fff", border: "1px solid #eee3d7", borderRadius: 16, padding: "14px 18px", minWidth: 150 }}>
-                <strong style={{ display: "block", fontSize: 28, color: "#1a1714" }}>70</strong>
-                <span style={{ color: "#706b65", fontSize: 13 }}>total library seats</span>
+                <strong style={{ display: "block", fontSize: 28, color: "#1a1714" }}>3</strong>
+                <span style={{ color: "#706b65", fontSize: 13 }}>library seating cameras</span>
               </div>
               <div style={{ background: "#fff", border: "1px solid #eee3d7", borderRadius: 16, padding: "14px 18px", minWidth: 150 }}>
                 <strong style={{ display: "block", fontSize: 28, color: "#1a1714" }}>2</strong>
-                <span style={{ color: "#706b65", fontSize: 13 }}>area zones</span>
+                <span style={{ color: "#706b65", fontSize: 13 }}>discussion-room cameras</span>
               </div>
             </div>
           </section>

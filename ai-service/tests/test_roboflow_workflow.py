@@ -99,6 +99,145 @@ def test_parse_camera_channels_rejects_invalid_channel_numbers():
         module.parse_camera_channels("1,two")
 
 
+def test_camera_occupancy_accumulates_connected_camera_counts(tmp_path):
+    cameras = [
+        {"id": "cam-1", "name": "Camera 1", "channel": 1, "source": "camera-1"},
+        {"id": "cam-2", "name": "Camera 2", "channel": 2, "source": "camera-2"},
+        {"id": "cam-3", "name": "Camera 3", "channel": 3, "source": "camera-3"},
+    ]
+    monitor = module.CameraMonitor(SimpleNamespace(), cameras, tmp_path / "calibration.json")
+    first, second, disconnected = monitor.feeds.values()
+    first.status = second.status = "connected"
+    first.latest = module.FrameResult(
+        people_count=2,
+        occupied_seats=2,
+        empty_seats=5,
+        entries=1,
+        mode="yolo-seat",
+    )
+    second.latest = module.FrameResult(
+        people_count=1,
+        occupied_seats=1,
+        empty_seats=3,
+        exits=1,
+        mode="yolo-seat",
+    )
+    disconnected.latest = module.FrameResult(
+        people_count=8,
+        occupied_seats=8,
+        empty_seats=0,
+        mode="yolo-seat",
+    )
+
+    result = monitor.occupancy(None)
+
+    assert result.people_count == 3
+    assert result.occupied_seats == 3
+    assert result.empty_seats == 8
+    assert result.occupancy_percentage == 27.3
+    assert result.entries == 1
+    assert result.exits == 1
+    assert result.mode == "yolo-seat"
+    assert monitor.occupancy("cam-1") == first.latest
+
+
+def test_camera_occupancy_groups_library_discussion_and_entrance_feeds(tmp_path):
+    cameras = [
+        {"id": f"cam-{index}", "name": f"Camera {index}", "channel": index, "source": f"camera-{index}"}
+        for index in range(1, 8)
+    ]
+    monitor = module.CameraMonitor(SimpleNamespace(), cameras, tmp_path / "calibration.json")
+    counts = {
+        "cam-1": (2, 2, 6),
+        "cam-2": (3, 1, 4),
+        "cam-3": (5, 0, 0),
+        "cam-4": (1, 1, 7),
+        "cam-5": (4, 0, 0),
+        "cam-6": (2, 2, 3),
+        "cam-7": (1, 0, 5),
+    }
+    for camera_id, feed in monitor.feeds.items():
+        feed.status = "connected"
+        people, occupied, available = counts[camera_id]
+        feed.latest = module.FrameResult(
+            people_count=people,
+            occupied_seats=occupied,
+            empty_seats=available,
+            mode="yolo-seat",
+        )
+
+    library = monitor.occupancy(None)
+    discussion = monitor.occupancy(None, "discussion")
+    entrance = monitor.occupancy(None, "entrance")
+    all_cameras = monitor.occupancy(None, "all")
+
+    assert (library.people_count, library.occupied_seats, library.empty_seats) == (6, 4, 17)
+    assert (discussion.people_count, discussion.occupied_seats, discussion.empty_seats) == (3, 2, 8)
+    assert (entrance.people_count, entrance.occupied_seats, entrance.empty_seats) == (9, 0, 0)
+    assert (all_cameras.occupied_seats, all_cameras.empty_seats) == (6, 25)
+
+
+def test_camera_occupancy_waits_when_no_feed_is_connected(tmp_path):
+    camera = {"id": "cam-1", "name": "Camera 1", "channel": 1, "source": "camera-1"}
+    monitor = module.CameraMonitor(SimpleNamespace(), [camera], tmp_path / "calibration.json")
+
+    result = monitor.occupancy(None)
+
+    assert result.mode == "waiting"
+    assert result.occupied_seats == 0
+    assert result.empty_seats == 0
+
+
+def test_camera_feed_median_smooths_flickering_people_and_seat_detections(monkeypatch):
+    feed = module.CameraFeed({
+        "id": "cam-2",
+        "name": "Library-2",
+        "channel": 2,
+        "source": "camera-2",
+    })
+    frame = np.zeros((20, 20, 3), dtype=np.uint8)
+    monkeypatch.setattr(feed, "_encode_preview", lambda *_args, **_kwargs: b"preview")
+
+    for sequence, (people, occupied, total) in enumerate([
+        (3, 3, 30),
+        (3, 3, 30),
+        (4, 4, 31),
+        (4, 4, 32),
+        (4, 4, 30),
+    ], start=1):
+        feed.publish_detection(
+            sequence,
+            frame,
+            module.FrameResult(
+                people_count=people,
+                occupied_seats=occupied,
+                empty_seats=total - occupied,
+                mode="yolo-seat",
+            ),
+        )
+
+    assert feed.latest.people_count == 4
+    assert feed.latest.occupied_seats == 4
+    assert feed.latest.empty_seats == 26
+    assert feed.latest.occupancy_percentage == 13.3
+
+
+def test_camera_feed_applies_person_confidence_calibrated_for_each_view():
+    cameras = {
+        camera_id: module.CameraFeed({
+            "id": camera_id,
+            "name": camera_id,
+            "channel": int(camera_id[-1]),
+            "source": camera_id,
+        })
+        for camera_id in ("cam-1", "cam-2", "cam-4")
+    }
+
+    assert cameras["cam-1"].person_confidence == module.PERSON_CONFIDENCE
+    assert cameras["cam-2"].person_confidence == 0.15
+    assert cameras["cam-4"].person_confidence == 0.15
+
+
 def test_configured_camera_sources_preserve_rtsp_settings_and_separate_channels():
     source = "rtsp://user:password@192.0.2.10:554/cam/realmonitor?channel=2&subtype=0"
 
@@ -243,6 +382,27 @@ def test_process_falls_back_to_detected_people_when_chair_state_is_missing(monke
     assert result.occupancy_percentage == 50.0
 
 
+def test_process_uses_camera_specific_person_confidence(monkeypatch):
+    engine = VisionEngine()
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    confidences = []
+
+    def fake_predict(_model, _frame, _classes, confidence, **_kwargs):
+        confidences.append(confidence)
+        return []
+
+    engine.person_model = object()
+    engine.fallback_model = None
+    engine.roboflow_seat_model = False
+    monkeypatch.setattr(module, "GENERIC_SEAT_FALLBACK", False)
+    monkeypatch.setattr(engine, "detect_seats", lambda _frame, _people: (0, 0, 0))
+    monkeypatch.setattr(engine, "_predict_detections", fake_predict)
+
+    engine.process(frame, person_confidence=0.20)
+
+    assert confidences == [0.20]
+
+
 def test_process_uses_detected_people_when_total_seat_count_is_zero(monkeypatch):
     engine = VisionEngine()
     engine.total_seats = 0
@@ -270,6 +430,7 @@ def test_process_uses_detected_people_when_total_seat_count_is_zero(monkeypatch)
 
 def test_process_keeps_valid_chair_state_even_when_people_count_is_higher(monkeypatch):
     engine = VisionEngine()
+    engine.seat_model = object()
     frame = np.zeros((200, 200, 3), dtype=np.uint8)
 
     def fake_predict(self, model, frame, classes, confidence, tiled=None, imgsz=640):
@@ -284,15 +445,15 @@ def test_process_keeps_valid_chair_state_even_when_people_count_is_higher(monkey
     monkeypatch.setattr(engine, "person_model", object())
     monkeypatch.setattr(engine, "fallback_model", None)
     monkeypatch.setattr(engine, "roboflow_seat_model", False)
-    monkeypatch.setattr(engine, "detect_seats", lambda _frame, _people: (13, 2, 11))
+    monkeypatch.setattr(engine, "detect_seats", lambda _frame, _people: (13, 8, 5))
     monkeypatch.setattr(VisionEngine, "_predict_detections", fake_predict)
 
     result = engine.process(frame)
 
     assert result.people_count == 5
-    assert result.occupied_seats == 2
-    assert result.empty_seats == 11
-    assert result.occupancy_percentage == 15.4
+    assert result.occupied_seats == 8
+    assert result.empty_seats == 5
+    assert result.occupancy_percentage == 61.5
 
 
 def test_process_runs_generic_fallback_when_specialized_seat_detection_succeeds(monkeypatch):
@@ -431,6 +592,203 @@ def test_process_uses_person_fallback_and_roi_filtered_generic_chairs_alongside_
     assert result.people_count == 2
     assert result.occupied_seats == 1
     assert result.empty_seats == 3
+
+
+def test_process_does_not_estimate_empty_seats_when_seat_model_detects_nothing(monkeypatch):
+    engine = VisionEngine()
+    engine.person_model = object()
+    engine.seat_model = SimpleNamespace(names={0: "empty chair", 1: "guest on chair", 2: "occupied chair"})
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    monkeypatch.setattr(module, "GENERIC_SEAT_FALLBACK", False)
+    monkeypatch.setattr(
+        engine,
+        "_predict_detections",
+        lambda model, *_args, **_kwargs: (
+            [{"bbox": [10, 10, 30, 60], "confidence": 0.9, "class_id": 0}]
+            if model is engine.person_model else []
+        ),
+    )
+
+    result = engine.process(frame)
+
+    assert result.people_count == 1
+    assert result.occupied_seats == 0
+    assert result.empty_seats == 0
+
+
+def test_process_preserves_occupied_seat_when_person_detector_misses_it(monkeypatch):
+    engine = VisionEngine()
+    engine.person_model = object()
+    engine.seat_model = SimpleNamespace(names={0: "empty chair", 1: "guest on chair", 2: "occupied chair"})
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    monkeypatch.setattr(module, "GENERIC_SEAT_FALLBACK", False)
+    monkeypatch.setattr(
+        engine,
+        "_predict_detections",
+        lambda model, *_args, **_kwargs: (
+            [] if model is engine.person_model else [
+                {"bbox": [10, 10, 30, 60], "confidence": 0.9, "class_id": 2}
+            ]
+        ),
+    )
+    monkeypatch.setattr(engine, "_annotate_local_detections", lambda *_args, **_kwargs: "")
+
+    result = engine.process(frame)
+
+    assert result.people_count == 0
+    assert result.occupied_seats == 1
+    assert result.empty_seats == 0
+
+
+def test_process_uses_generic_chair_detections_to_count_unclassified_available_seats(monkeypatch):
+    engine = VisionEngine()
+    person_model = object()
+    fallback_model = SimpleNamespace(names={0: "person", 56: "chair"})
+    seat_model = object()
+    engine.person_model = person_model
+    engine.fallback_model = fallback_model
+    engine.seat_model = seat_model
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    chairs = [
+        {"bbox": [10 + index * 30, 125, 30 + index * 30, 175], "confidence": 0.8, "class_id": 56}
+        for index in range(5)
+    ]
+    monkeypatch.setattr(module, "GENERIC_SEAT_FALLBACK", True)
+
+    def predict(model, _frame, _classes, *_args, **_kwargs):
+        if model is fallback_model:
+            return chairs
+        if model is person_model:
+            return []
+        raise AssertionError("The seat model is stubbed by detect_seats.")
+
+    monkeypatch.setattr(engine, "_predict_detections", predict)
+    monkeypatch.setattr(engine, "detect_seats", lambda *_args, **_kwargs: (2, 1, 1))
+    monkeypatch.setattr(engine, "_annotate_local_detections", lambda *_args, **_kwargs: "")
+
+    result = engine.process(frame)
+
+    assert result.occupied_seats == 0
+    assert result.empty_seats == 5
+    assert result.occupancy_percentage == 0.0
+
+
+def test_process_matches_people_to_generic_chairs_as_occupied(monkeypatch):
+    engine = VisionEngine()
+    person_model = object()
+    fallback_model = SimpleNamespace(names={0: "person", 56: "chair"})
+    seat_model = object()
+    engine.person_model = person_model
+    engine.fallback_model = fallback_model
+    engine.seat_model = seat_model
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    chairs = [
+        {"bbox": [10, 100, 55, 170], "confidence": 0.8, "class_id": 56},
+        {"bbox": [75, 100, 120, 170], "confidence": 0.8, "class_id": 56},
+        {"bbox": [140, 100, 185, 170], "confidence": 0.8, "class_id": 56},
+    ]
+    monkeypatch.setattr(module, "GENERIC_SEAT_FALLBACK", True)
+
+    def predict(model, _frame, _classes, *_args, **_kwargs):
+        if model is fallback_model:
+            return chairs
+        if model is person_model:
+            return [{"bbox": [15, 55, 50, 155], "confidence": 0.9, "class_id": 0}]
+        raise AssertionError("The seat model is stubbed by detect_seats.")
+
+    monkeypatch.setattr(engine, "_predict_detections", predict)
+    monkeypatch.setattr(engine, "detect_seats", lambda *_args, **_kwargs: (0, 0, 0))
+    monkeypatch.setattr(engine, "_annotate_local_detections", lambda *_args, **_kwargs: "")
+
+    result = engine.process(frame)
+
+    assert result.occupied_seats == 1
+    assert result.empty_seats == 2
+    assert result.occupancy_percentage == 33.3
+
+
+def test_process_clears_seat_model_false_positives_when_generic_person_detector_finds_no_people(monkeypatch):
+    engine = VisionEngine()
+    person_model = object()
+    fallback_model = SimpleNamespace(names={0: "person", 56: "chair"})
+    seat_model = object()
+    engine.person_model = person_model
+    engine.fallback_model = fallback_model
+    engine.seat_model = seat_model
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    monkeypatch.setattr(module, "GENERIC_SEAT_FALLBACK", True)
+
+    def predict(model, _frame, _classes, *_args, **_kwargs):
+        if model is fallback_model:
+            return []
+        if model is person_model:
+            return []
+        raise AssertionError("The seat model is stubbed by detect_seats.")
+
+    monkeypatch.setattr(engine, "_predict_detections", predict)
+    monkeypatch.setattr(engine, "detect_seats", lambda *_args, **_kwargs: (3, 2, 1))
+
+    result = engine.process(frame)
+
+    assert result.people_count == 0
+    assert result.occupied_seats == 0
+    assert result.empty_seats == 3
+
+
+def test_process_uses_people_inside_calibrated_seat_roi_to_recover_missed_occupied_seats(monkeypatch):
+    engine = VisionEngine()
+    person_model = object()
+    fallback_model = SimpleNamespace(names={0: "person", 56: "chair"})
+    engine.person_model = person_model
+    engine.fallback_model = fallback_model
+    engine.seat_model = object()
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    people = [
+        {"bbox": [10 + index * 35, 30, 30 + index * 35, 90], "confidence": 0.9, "class_id": 0}
+        for index in range(4)
+    ]
+    monkeypatch.setattr(module, "GENERIC_SEAT_FALLBACK", True)
+
+    def predict(model, _frame, _classes, *_args, **_kwargs):
+        return people if model is person_model else []
+
+    monkeypatch.setattr(engine, "_predict_detections", predict)
+    monkeypatch.setattr(engine, "detect_seats", lambda *_args, **_kwargs: (8, 1, 7))
+
+    result = engine.process(
+        frame,
+        seat_roi=[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+    )
+
+    assert result.people_count == 4
+    assert result.occupied_seats == 4
+    assert result.empty_seats == 4
+
+
+def test_process_does_not_count_people_outside_the_calibrated_seat_roi_as_occupants(monkeypatch):
+    engine = VisionEngine()
+    person_model = object()
+    fallback_model = SimpleNamespace(names={0: "person", 56: "chair"})
+    engine.person_model = person_model
+    engine.fallback_model = fallback_model
+    engine.seat_model = object()
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    monkeypatch.setattr(module, "GENERIC_SEAT_FALLBACK", True)
+
+    def predict(model, _frame, _classes, *_args, **_kwargs):
+        return [{"bbox": [10, 10, 30, 50], "confidence": 0.9, "class_id": 0}] if model is person_model else []
+
+    monkeypatch.setattr(engine, "_predict_detections", predict)
+    monkeypatch.setattr(engine, "detect_seats", lambda *_args, **_kwargs: (5, 2, 3))
+
+    result = engine.process(
+        frame,
+        seat_roi=[(0.5, 0.5), (1.0, 0.5), (1.0, 1.0), (0.5, 1.0)],
+    )
+
+    assert result.people_count == 1
+    assert result.occupied_seats == 0
+    assert result.empty_seats == 5
 
 
 def test_camera_calibration_persists_per_camera_and_can_be_cleared(tmp_path):

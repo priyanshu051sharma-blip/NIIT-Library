@@ -2,67 +2,59 @@
 
 import { useEffect, useState } from "react";
 import LiveDetection from "../../components/LiveDetection";
+import { useOccupancy } from "../../context/OccupancyContext";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const TOTAL_SEATS = 70;
 
 export default function AdminDashboard() {
-  const [snapshot, setSnapshot] = useState<any>(null);
-  const [analytics, setAnalytics] = useState<any>(null);
-  const [areaStatus, setAreaStatus] = useState({
-    leftSide: { total: 35, available: 24, occupied: 11, status: "AVAILABLE" },
-    rightSide: { total: 35, available: 18, occupied: 17, status: "AVAILABLE" },
-  });
   const [bookings, setBookings] = useState<any[]>([]);
-  const hourlyLogs = [
-    { hour: "08:00", occupied: 15, available: 55, capacity: TOTAL_SEATS, occupancy: 21 },
-    { hour: "09:00", occupied: 18, available: 52, capacity: TOTAL_SEATS, occupancy: 26 },
-    { hour: "10:00", occupied: 24, available: 46, capacity: TOTAL_SEATS, occupancy: 34 },
-    { hour: "11:00", occupied: 26, available: 44, capacity: TOTAL_SEATS, occupancy: 37 },
-    { hour: "12:00", occupied: 30, available: 40, capacity: TOTAL_SEATS, occupancy: 43 },
-    { hour: "13:00", occupied: 28, available: 42, capacity: TOTAL_SEATS, occupancy: 40 },
-    { hour: "14:00", occupied: 25, available: 45, capacity: TOTAL_SEATS, occupancy: 36 },
-    { hour: "15:00", occupied: 22, available: 48, capacity: TOTAL_SEATS, occupancy: 31 },
-  ];
+  const [bookingsError, setBookingsError] = useState<string | null>(null);
+  const { snapshot, error: loadError } = useOccupancy();
 
   useEffect(() => {
     const role = localStorage.getItem("smartlib_role");
     const token = role === "ADMIN" || role === "LIBRARIAN" ? localStorage.getItem("smartlib_token") || "demo-admin" : "demo-admin";
-    const storedArea = localStorage.getItem("smartlib_area_status");
-    const storedBookings = localStorage.getItem("smartlib_bookings");
-
-    if (storedArea) {
-      setAreaStatus(JSON.parse(storedArea));
-    }
-    if (storedBookings) {
-      setBookings(JSON.parse(storedBookings));
-    }
-
-    const headers = { Authorization: `Bearer ${token}` };
-
-    Promise.all([
-      fetch(`${API}/api/occupancy/current`, { headers }),
-      fetch(`${API}/api/admin/analytics`, { headers }),
-      fetch(`${API}/api/cameras`, { headers }),
-    ])
-      .then(async ([snapshotRes, analyticsRes, camerasRes]) => {
-        setSnapshot(await snapshotRes.json());
-        setAnalytics(await analyticsRes.json());
-        await camerasRes.json();
-      })
-      .catch(() => {
-        setSnapshot({ people_count: 42, total_seats: TOTAL_SEATS, occupied_seats: 42, empty_seats: 28, occupancy_percentage: 60, status: "MODERATE" });
-        setAnalytics({ peak_occupancy: 72, average_occupancy: 55.6, hourly: [] });
-      });
+    let active = true;
+    let requestInProgress = false;
+    const refreshBookings = async () => {
+      if (requestInProgress) return;
+      requestInProgress = true;
+      try {
+        const response = await fetch(`${API}/api/bookings`, {
+          headers: { Authorization: `Bearer ${token}` },
+          cache: "no-store",
+        });
+        if (!response.ok) throw new Error("Could not load shared room bookings.");
+        const savedBookings = await response.json();
+        if (active) {
+          setBookings(savedBookings.filter((booking: any) => booking.status === "CONFIRMED").map((booking: any) => ({
+            id: booking.id,
+            roomId: booking.room_id,
+            date: booking.booking_date,
+            startTime: booking.start_time,
+            endTime: booking.end_time,
+            student: booking.student_id,
+          })));
+          setBookingsError(null);
+        }
+      } catch (requestError) {
+        if (active) setBookingsError(requestError instanceof Error ? requestError.message : "Could not load shared room bookings.");
+      } finally {
+        requestInProgress = false;
+      }
+    };
+    void refreshBookings();
+    const timer = window.setInterval(() => void refreshBookings(), 5000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
   }, []);
-
-  const leftStatus = areaStatus.leftSide.available > 0 ? "Green flag" : "Red flag";
-  const rightStatus = areaStatus.rightSide.available > 0 ? "Green flag" : "Red flag";
 
   return (
     <main style={{ padding: 32, minHeight: "100vh", background: "#f5efe9" }}>
       <div style={{ maxWidth: 1100, margin: "0 auto" }}>
-        <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
+        <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24, gap: 16, flexWrap: "wrap" }}>
           <div>
             <p style={{ margin: 0, color: "#8e796d", letterSpacing: 1.2, textTransform: "uppercase", fontSize: 12 }}>Operations</p>
             <h1 style={{ margin: "8px 0 0", fontSize: 38 }}>Library operations</h1>
@@ -70,53 +62,46 @@ export default function AdminDashboard() {
           <button onClick={() => (window.location.href = "/")} style={{ background: "#1d1b19", color: "#fff", border: "none", padding: "12px 18px", borderRadius: 12, cursor: "pointer" }}>Return to portal</button>
         </header>
 
-        <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 18 }}>
-          <StatCard label="Library load" value={`${snapshot?.occupancy_percentage ?? 60}%`} />
-          <StatCard label="Current people" value={snapshot?.people_count ?? 42} />
-          <StatCard label="Occupied" value={snapshot?.occupied_seats ?? 42} />
-          <StatCard label="Total seats" value={TOTAL_SEATS} />
+        {loadError && <p role="alert" style={{ color: "#a63125" }}>{loadError}</p>}
+        {snapshot?.mode === "database-fallback" && (
+          <p role="status" style={{ color: "#8a5b22" }}>
+            Camera AI is unavailable; the counts below are database fallback values, not live detections.
+          </p>
+        )}
+        {snapshot?.mode === "waiting" && (
+          <p role="status" style={{ color: "#8a5b22" }}>Waiting for a connected camera to detect seats.</p>
+        )}
+        {snapshot && (
+          <p style={{ color: "#81756d", fontSize: 13, marginBottom: 12 }}>
+            Shared live snapshot · updated {new Date(snapshot.timestamp).toLocaleTimeString()} · {snapshot.camera_groups.library.detected_cameras}/{snapshot.camera_groups.library.connected_cameras} library cameras reporting
+          </p>
+        )}
+
+        <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 18 }}>
+          <StatCard label="Library load" value={snapshot ? `${snapshot.occupancy_percentage}%` : "—"} />
+          <StatCard label="Current people" value={snapshot?.people_count ?? "—"} />
+          <StatCard label="Occupied seats" value={snapshot?.occupied_seats ?? "—"} />
+          <StatCard label="Available seats" value={snapshot?.empty_seats ?? "—"} />
+          <StatCard label="Total detected seats" value={snapshot?.total_seats ?? "—"} />
         </section>
 
-        <section style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 24, marginTop: 28 }}>
+        <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 18, marginTop: 18 }}>
+          <GroupCard label="Discussion rooms · Cabin-1 and Cabin-2" group={snapshot?.camera_groups.discussion} />
+          <GroupCard label="Entrance · Library Main and Library-3" group={snapshot?.camera_groups.entrance} peopleOnly />
+        </section>
+
+        <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 24, marginTop: 28 }}>
           <div style={{ background: "#fff", borderRadius: 20, padding: 24, border: "1px solid #eadfce" }}>
-            <h2>Live occupancy summary</h2>
-            <p style={{ color: "#605c58" }}>Current status: <strong>{snapshot?.status ?? "MODERATE"}</strong></p>
+            <h2>Library seating load</h2>
+            <p style={{ color: "#605c58" }}>Based on Library-1, Library-2 and Library-4 only.</p>
+            <p style={{ color: "#605c58" }}>People detected and occupied seats are separate model measurements; they are not forced to match.</p>
+            <p style={{ color: "#605c58" }}>Current status: <strong>{snapshot?.status ?? "WAITING"}</strong></p>
+            <p style={{ color: "#605c58" }}>Detection source: <strong>{snapshot?.mode ?? "—"}</strong></p>
             <ul style={{ color: "#514d4a", lineHeight: 2 }}>
-              <li>Occupied seats: {snapshot?.occupied_seats ?? 42}</li>
-              <li>Available seats: {snapshot?.empty_seats ?? 28}</li>
-              <li>Total seats: {snapshot?.total_seats ?? TOTAL_SEATS}</li>
+              <li>Occupied seats: {snapshot?.occupied_seats ?? "—"}</li>
+              <li>Vacant / available seats: {snapshot?.empty_seats ?? "—"}</li>
+              <li>Total detected seats: {snapshot?.total_seats ?? "—"}</li>
             </ul>
-
-            <div style={{ display: "grid", gap: 12, marginTop: 18 }}>
-              <AreaFlag title="Left door" status={leftStatus} available={areaStatus.leftSide.available} total={areaStatus.leftSide.total} />
-              <AreaFlag title="Right side" status={rightStatus} available={areaStatus.rightSide.available} total={areaStatus.rightSide.total} />
-            </div>
-
-            <div style={{ marginTop: 24 }}>
-              <h3 style={{ marginBottom: 10 }}>Hourly capacity log</h3>
-              <div style={{ overflowX: "auto" }}>
-                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-                  <thead>
-                    <tr style={{ textAlign: "left", color: "#6c6662" }}>
-                      <th style={{ padding: "8px 10px", borderBottom: "1px solid #eae0d6" }}>Hour</th>
-                      <th style={{ padding: "8px 10px", borderBottom: "1px solid #eae0d6" }}>Used</th>
-                      <th style={{ padding: "8px 10px", borderBottom: "1px solid #eae0d6" }}>Available</th>
-                      <th style={{ padding: "8px 10px", borderBottom: "1px solid #eae0d6" }}>Occupancy</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {hourlyLogs.map((log) => (
-                      <tr key={log.hour}>
-                        <td style={{ padding: "8px 10px", borderBottom: "1px solid #f0e5dc" }}>{log.hour}</td>
-                        <td style={{ padding: "8px 10px", borderBottom: "1px solid #f0e5dc" }}>{log.occupied}</td>
-                        <td style={{ padding: "8px 10px", borderBottom: "1px solid #f0e5dc" }}>{log.available}</td>
-                        <td style={{ padding: "8px 10px", borderBottom: "1px solid #f0e5dc" }}>{log.occupancy}%</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
           </div>
 
           <div style={{ background: "#fff", borderRadius: 20, padding: 24, border: "1px solid #eadfce" }}>
@@ -129,6 +114,7 @@ export default function AdminDashboard() {
 
             <div style={{ marginTop: 22 }}>
               <h3 style={{ marginBottom: 10 }}>Booked discussion rooms</h3>
+              {bookingsError && <p role="alert" style={{ color: "#a63125" }}>{bookingsError}</p>}
               {bookings.length ? (
                 <div style={{ display: "grid", gap: 10 }}>
                   {bookings.map((booking) => (
@@ -157,22 +143,37 @@ export default function AdminDashboard() {
   );
 }
 
-function AreaFlag({ title, status, available, total }: { title: string; status: string; available: number; total: number }) {
-  const isGreen = status === "Green flag";
-  return (
-    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 12px", borderRadius: 12, background: isGreen ? "#edf9f1" : "#fde9e7", border: `1px solid ${isGreen ? "#c9ecd4" : "#f4c1bb"}` }}>
-      <span>{title}</span>
-      <span style={{ fontWeight: 700, color: isGreen ? "#1d8a4d" : "#c84d3d" }}>{status}</span>
-      <span>{available} / {total} seats</span>
-    </div>
-  );
-}
-
 function StatCard({ label, value }: { label: string; value: string | number }) {
   return (
     <div style={{ background: "#fff", borderRadius: 18, padding: 22, border: "1px solid #eadfce" }}>
       <div style={{ fontSize: 12, color: "#82756d", textTransform: "uppercase", letterSpacing: 1.2 }}>{label}</div>
       <div style={{ fontSize: 32, fontWeight: 800, marginTop: 10 }}>{value}</div>
+    </div>
+  );
+}
+
+function GroupCard({
+  label,
+  group,
+  peopleOnly = false,
+}: {
+  label: string;
+  group?: { people_count: number; occupied_seats: number; empty_seats: number; detected_cameras: number };
+  peopleOnly?: boolean;
+}) {
+  return (
+    <div style={{ background: "#fff", borderRadius: 18, padding: 22, border: "1px solid #eadfce" }}>
+      <div style={{ fontSize: 12, color: "#82756d", textTransform: "uppercase", letterSpacing: 1.1 }}>{label}</div>
+      <div style={{ display: "flex", gap: 18, flexWrap: "wrap", marginTop: 14, color: "#514d4a" }}>
+        <span>People <strong>{group?.people_count ?? "—"}</strong></span>
+        {!peopleOnly && <>
+          <span>Occupied <strong>{group?.occupied_seats ?? "—"}</strong></span>
+          <span>Available <strong>{group?.empty_seats ?? "—"}</strong></span>
+        </>}
+      </div>
+      <div style={{ color: "#81756d", fontSize: 12, marginTop: 12 }}>
+        {group ? `${group.detected_cameras} camera feeds reporting` : "Waiting for camera data"}
+      </div>
     </div>
   );
 }

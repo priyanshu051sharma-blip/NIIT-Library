@@ -140,40 +140,112 @@ ROOMS = [
 ]
 
 
-def read_ai_snapshot() -> dict[str, Any] | None:
+def read_ai_cameras() -> list[dict[str, Any]] | None:
     try:
-        with request.urlopen(f"{AI_SERVICE_URL}/ai/occupancy", timeout=2) as response:
+        with request.urlopen(f"{AI_SERVICE_URL}/ai/cameras", timeout=2) as response:
             payload = response.read().decode("utf-8")
-            return json.loads(payload)
+            cameras = json.loads(payload)
+            return cameras if isinstance(cameras, list) else None
     except Exception:
         return None
+
+
+def camera_group_snapshots(cameras: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    groups = {}
+    for purpose in ("library", "discussion", "entrance"):
+        purpose_cameras = [camera for camera in cameras if camera.get("purpose") == purpose]
+        connected = [camera for camera in purpose_cameras if camera.get("status") == "connected"]
+        detected = [
+            camera for camera in connected
+            if camera.get("occupancy", {}).get("mode") != "waiting"
+        ]
+        people = sum(int(camera.get("occupancy", {}).get("people_count", 0)) for camera in detected)
+        occupied = sum(
+            int(camera.get("occupancy", {}).get("occupied_seats", 0))
+            for camera in detected
+        ) if purpose != "entrance" else 0
+        available = sum(
+            int(camera.get("occupancy", {}).get("empty_seats", 0))
+            for camera in detected
+        ) if purpose != "entrance" else 0
+        modes = {camera.get("occupancy", {}).get("mode", "unknown") for camera in detected}
+        groups[purpose] = {
+            "purpose": purpose,
+            "people_count": people,
+            "occupied_seats": occupied,
+            "empty_seats": available,
+            "total_seats": occupied + available,
+            "occupancy_percentage": round(occupied / (occupied + available) * 100, 1) if occupied + available else 0,
+            "entries": sum(int(camera.get("occupancy", {}).get("entries", 0)) for camera in detected),
+            "exits": sum(int(camera.get("occupancy", {}).get("exits", 0)) for camera in detected),
+            "connected_cameras": len(connected),
+            "detected_cameras": len(detected),
+            "mode": next(iter(modes)) if len(modes) == 1 else "multi-camera" if modes else "waiting",
+        }
+    return groups
 
 
 def current_snapshot() -> dict[str, Any]:
     occupied = sum(seat["status"] == "occupied" for seat in SEATS)
     total = max(len(SEATS), TOTAL_SEATS)
     people = occupied
-    ai_snapshot = read_ai_snapshot()
-    if ai_snapshot:
-        people = int(ai_snapshot.get("people_count", people))
-        occupied = int(ai_snapshot.get("occupied_seats", occupied))
-        detected_empty = max(int(ai_snapshot.get("empty_seats", total - occupied)), 0)
-        detected_total = max(occupied + detected_empty, 0)
-        total = detected_total if ai_snapshot.get("mode") != "mock" and detected_total > 0 else max(TOTAL_SEATS, total)
-        empty = max(detected_total - occupied, 0) if detected_total > 0 else max(total - occupied, 0)
-    else:
+    cameras = read_ai_cameras()
+    if cameras is None:
+        mode = "database-fallback"
         empty = max(total - occupied, 0)
+        groups = {
+            "library": {
+                "purpose": "library",
+                "people_count": people,
+                "occupied_seats": occupied,
+                "empty_seats": empty,
+                "total_seats": total,
+                "occupancy_percentage": round(occupied / total * 100, 1) if total else 0,
+                "entries": 0,
+                "exits": 0,
+                "connected_cameras": 0,
+                "detected_cameras": 0,
+                "mode": mode,
+            },
+            "discussion": {"purpose": "discussion", "people_count": 0, "occupied_seats": 0, "empty_seats": 0, "total_seats": 0, "occupancy_percentage": 0, "entries": 0, "exits": 0, "connected_cameras": 0, "detected_cameras": 0, "mode": "unavailable"},
+            "entrance": {"purpose": "entrance", "people_count": 0, "occupied_seats": 0, "empty_seats": 0, "total_seats": 0, "occupancy_percentage": 0, "entries": 0, "exits": 0, "connected_cameras": 0, "detected_cameras": 0, "mode": "unavailable"},
+        }
+        cameras = []
+    else:
+        groups = camera_group_snapshots(cameras)
+        library = groups["library"]
+        people = library["people_count"]
+        occupied = library["occupied_seats"]
+        empty = library["empty_seats"]
+        total = library["total_seats"]
+        mode = library["mode"]
+    if mode == "database-fallback":
+        zones = zone_snapshots()
+    elif total:
+        zones = [{
+            "id": "library-cameras",
+            "name": "Library (cameras 1, 2, 4)",
+            "capacity": total,
+            "occupied": occupied,
+            "available": empty,
+            "percentage": round(occupied / total * 100, 1),
+        }]
+    else:
+        zones = []
     return {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "people_count": people,
+        "camera_groups": groups,
+        "cameras": cameras,
         "total_seats": total,
         "occupied_seats": occupied,
         "empty_seats": empty,
         "occupancy_percentage": round((occupied / max((occupied + empty), 1)) * 100, 1) if (occupied + empty) > 0 else 0,
-        "entries": int(ai_snapshot.get("entries", 86)) if ai_snapshot else 86,
-        "exits": int(ai_snapshot.get("exits", 61)) if ai_snapshot else 61,
+        "entries": groups["library"]["entries"],
+        "exits": groups["library"]["exits"],
         "status": occupancy_status(occupied / total if total else 0),
-        "zones": zone_snapshots(),
+        "zones": zones,
+        "mode": mode,
         "privacy": "No facial recognition or identity data is processed.",
     }
 

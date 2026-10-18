@@ -2,26 +2,9 @@
 
 import { useEffect, useState } from "react";
 import LiveDetection from "../../components/LiveDetection";
+import { useOccupancy } from "../../context/OccupancyContext";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const TOTAL_SEATS = 70;
-
-type Snapshot = {
-  people_count: number;
-  total_seats: number;
-  occupied_seats: number;
-  empty_seats: number;
-  occupancy_percentage: number;
-  status: string;
-  zones: Array<{ id: string; name: string; capacity: number; occupied: number; available: number; percentage: number }>;
-};
-
-type AreaStatus = {
-  total: number;
-  available: number;
-  occupied: number;
-  status: "AVAILABLE" | "FULL";
-};
 
 type BookingForm = {
   roomId: string;
@@ -30,15 +13,20 @@ type BookingForm = {
   endTime: string;
 };
 
+type DiscussionRoom = {
+  id: string;
+  name: string;
+  capacity: number;
+  location: string;
+  status: string;
+};
+
 export default function StudentDashboard() {
-  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
-  const [rooms, setRooms] = useState<any[]>([]);
+  const [rooms, setRooms] = useState<DiscussionRoom[]>([]);
+  const [roomError, setRoomError] = useState<string | null>(null);
   const [token, setToken] = useState<string>("");
   const [studentName, setStudentName] = useState<string>("Student");
-  const [areaStatus, setAreaStatus] = useState<{ leftSide: AreaStatus; rightSide: AreaStatus }>({
-    leftSide: { total: 35, available: 24, occupied: 11, status: "AVAILABLE" },
-    rightSide: { total: 35, available: 18, occupied: 17, status: "AVAILABLE" },
-  });
+  const { snapshot, error: loadError } = useOccupancy();
   const [bookingForm, setBookingForm] = useState<BookingForm>({
     roomId: "DR-01",
     date: "",
@@ -55,30 +43,16 @@ export default function StudentDashboard() {
     setToken(savedToken);
     setStudentName(savedStudent);
 
-    const savedArea = localStorage.getItem("smartlib_area_status");
-    if (savedArea) {
-      setAreaStatus(JSON.parse(savedArea));
-    }
-
     const headers = { Authorization: `Bearer ${savedToken}` };
 
-    Promise.all([
-      fetch(`${API}/api/occupancy/current`, { headers }),
-      fetch(`${API}/api/rooms`, { headers }),
-    ])
-      .then(async ([snapshotRes, roomsRes]) => {
-        const snapshotData = await snapshotRes.json();
-        const roomsData = await roomsRes.json();
-        setSnapshot(snapshotData);
-        setRooms(roomsData);
+    fetch(`${API}/api/rooms`, { headers })
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Could not load room availability.");
+        setRooms(await response.json());
+        setRoomError(null);
       })
-      .catch(() => {
-        setSnapshot({ people_count: 42, total_seats: TOTAL_SEATS, occupied_seats: 42, empty_seats: 28, occupancy_percentage: 60, status: "MODERATE", zones: [] });
-        setRooms([
-          { id: "DR-01", name: "Focus Room 01", status: "AVAILABLE", capacity: 6 },
-          { id: "DR-02", name: "Focus Room 02", status: "OCCUPIED", capacity: 8 },
-          { id: "DR-03", name: "Focus Room 03", status: "AVAILABLE", capacity: 4 },
-        ]);
+      .catch((requestError: unknown) => {
+        setRoomError(requestError instanceof Error ? requestError.message : "Could not load room availability.");
       });
   }, []);
 
@@ -94,45 +68,20 @@ export default function StudentDashboard() {
           end_time: `${bookingForm.endTime}:00`,
         }),
       });
-
-      const booking = {
-        id: `BR-${Date.now()}`,
-        roomId: bookingForm.roomId,
-        date: bookingForm.date,
-        startTime: bookingForm.startTime,
-        endTime: bookingForm.endTime,
-        student: studentName,
-      };
-
-      const currentBookings = JSON.parse(localStorage.getItem("smartlib_bookings") || "[]");
-      currentBookings.push(booking);
-      localStorage.setItem("smartlib_bookings", JSON.stringify(currentBookings));
-
-      if (response.ok) {
-        alert("Room booking created successfully and synced with the librarian portal.");
-      } else {
-        alert("Booking saved locally. The librarian portal will still reflect the booking in sync.");
-      }
-    } catch {
-      const booking = {
-        id: `BR-${Date.now()}`,
-        roomId: bookingForm.roomId,
-        date: bookingForm.date,
-        startTime: bookingForm.startTime,
-        endTime: bookingForm.endTime,
-        student: studentName,
-      };
-      const currentBookings = JSON.parse(localStorage.getItem("smartlib_bookings") || "[]");
-      currentBookings.push(booking);
-      localStorage.setItem("smartlib_bookings", JSON.stringify(currentBookings));
-      alert("Booking saved locally. The librarian view is updated in sync.");
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "Could not create the room booking.");
+      alert("Room booking confirmed and shared with the staff portal.");
+    } catch (requestError) {
+      alert(requestError instanceof Error ? requestError.message : "Could not create the room booking.");
     }
   };
 
-  const totalAvailable = areaStatus.leftSide.available + areaStatus.rightSide.available;
-  const occupiedNow = Math.max(TOTAL_SEATS - totalAvailable, 0);
-  const occupancyPercent = Math.round((occupiedNow / TOTAL_SEATS) * 100);
-  const hasSpace = totalAvailable > 0;
+  const availableSeats = snapshot?.empty_seats ?? 0;
+  const seatStatus = !snapshot
+    ? "Loading"
+    : snapshot.mode === "waiting" || snapshot.total_seats === 0
+      ? "No camera data"
+      : availableSeats > 0 ? "Available" : "Full";
 
   return (
     <main style={{ padding: 32, background: "#f7f1ea", minHeight: "100vh" }}>
@@ -146,37 +95,50 @@ export default function StudentDashboard() {
           <button onClick={() => (window.location.href = "/")} style={{ background: "#1d1b19", color: "#fff", border: "none", padding: "12px 18px", borderRadius: 12, cursor: "pointer" }}>Back to portal</button>
         </header>
 
-        <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 18 }}>
-          <StatCard label="Total seats" value={TOTAL_SEATS} />
-          <StatCard label="Open seats" value={snapshot?.empty_seats ?? totalAvailable} />
-          <StatCard label="Occupancy" value={`${snapshot?.occupancy_percentage ?? occupancyPercent}%`} />
-          <StatCard label="Seat status" value={hasSpace ? "Available" : "Full"} />
+        {loadError && <p role="alert" style={{ color: "#a63125" }}>{loadError}</p>}
+        {roomError && <p role="alert" style={{ color: "#a63125" }}>{roomError}</p>}
+        {snapshot?.mode === "database-fallback" && (
+          <p role="status" style={{ color: "#8a5b22" }}>
+            Camera AI is unavailable; the counts below are database fallback values, not live detections.
+          </p>
+        )}
+        {snapshot?.mode === "waiting" && (
+          <p role="status" style={{ color: "#8a5b22" }}>Waiting for a connected camera to detect seats.</p>
+        )}
+        {snapshot && (
+          <p style={{ color: "#81756d", fontSize: 13, marginBottom: 12 }}>
+            Shared live snapshot · updated {new Date(snapshot.timestamp).toLocaleTimeString()} · {snapshot.camera_groups.library.detected_cameras}/{snapshot.camera_groups.library.connected_cameras} library cameras reporting
+          </p>
+        )}
+
+        <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 18 }}>
+          <StatCard label="Total detected seats" value={snapshot?.total_seats ?? "—"} />
+          <StatCard label="People detected" value={snapshot?.people_count ?? "—"} />
+          <StatCard label="Occupied seats" value={snapshot?.occupied_seats ?? "—"} />
+          <StatCard label="Available seats" value={snapshot?.empty_seats ?? "—"} />
+          <StatCard label="Occupancy" value={snapshot ? `${snapshot.occupancy_percentage}%` : "—"} />
+          <StatCard label="Seat status" value={seatStatus} />
         </section>
 
-        <section style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: 24, marginTop: 28 }}>
+        <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 18, marginTop: 18 }}>
+          <GroupCard label="Discussion rooms · Cabin-1 and Cabin-2" group={snapshot?.camera_groups.discussion} />
+          <GroupCard label="Entrance · Library Main and Library-3" group={snapshot?.camera_groups.entrance} peopleOnly />
+        </section>
+
+        <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 24, marginTop: 28 }}>
           <div style={{ background: "#fff", borderRadius: 20, padding: 24, border: "1px solid #eadfce" }}>
-            <h2 style={{ marginTop: 0 }}>Seat availability</h2>
-            <p style={{ color: "#5f5852", marginTop: 0 }}>Total library seats: <strong>{TOTAL_SEATS}</strong></p>
-
-            <div style={{ display: "grid", gap: 16 }}>
-              <AreaCard
-                title="Left side"
-                label="Left door"
-                status={areaStatus.leftSide.status}
-                available={areaStatus.leftSide.available}
-                occupied={areaStatus.leftSide.occupied}
-                total={areaStatus.leftSide.total}
-              />
-
-              <AreaCard
-                title="Right side"
-                label="Right side"
-                status={areaStatus.rightSide.status}
-                available={areaStatus.rightSide.available}
-                occupied={areaStatus.rightSide.occupied}
-                total={areaStatus.rightSide.total}
-              />
-            </div>
+            <h2 style={{ marginTop: 0 }}>Live seat availability</h2>
+            <p style={{ color: "#5f5852", marginTop: 0 }}>
+              Occupied: <strong>{snapshot?.occupied_seats ?? "—"}</strong>
+              {" · "}
+              Vacant / available: <strong>{snapshot?.empty_seats ?? "—"}</strong>
+            </p>
+            <p style={{ color: "#5f5852" }}>
+              Library load uses Library-1, Library-2 and Library-4 only. Cabin cameras are counted separately as discussion rooms; Library Main and Library-3 are entrance cameras.
+            </p>
+            <p style={{ color: "#5f5852" }}>
+              People detected and occupied seats are separate measurements. Occupied seats are supported by seat detections and people inside the calibrated seating area.
+            </p>
           </div>
 
           <div style={{ background: "#fff", borderRadius: 20, padding: 24, border: "1px solid #eadfce" }}>
@@ -185,9 +147,11 @@ export default function StudentDashboard() {
               <label style={{ display: "grid", gap: 8, fontWeight: 600 }}>
                 Room
                 <select value={bookingForm.roomId} onChange={(e) => setBookingForm({ ...bookingForm, roomId: e.target.value })} style={fieldStyle}>
-                  <option value="DR-01">Focus Room 01</option>
-                  <option value="DR-02">Focus Room 02</option>
-                  <option value="DR-03">Focus Room 03</option>
+                  {rooms.map((room) => (
+                    <option key={room.id} value={room.id} disabled={room.status !== "AVAILABLE"}>
+                      {room.name} · {room.capacity} seats · {room.status}
+                    </option>
+                  ))}
                 </select>
               </label>
 
@@ -208,7 +172,7 @@ export default function StudentDashboard() {
                 </label>
               </div>
 
-              <button onClick={bookRoom} style={{ background: "#d9703f", border: "none", color: "#fff", borderRadius: 12, padding: "12px 16px", cursor: "pointer", fontWeight: 700 }}>
+              <button onClick={bookRoom} disabled={!rooms.length} style={{ background: "#d9703f", border: "none", color: "#fff", borderRadius: 12, padding: "12px 16px", cursor: rooms.length ? "pointer" : "not-allowed", fontWeight: 700, opacity: rooms.length ? 1 : 0.6 }}>
                 Confirm booking
               </button>
             </div>
@@ -225,44 +189,37 @@ export default function StudentDashboard() {
   );
 }
 
-function AreaCard({ title, label, status, available, occupied, total }: { title: string; label: string; status: "AVAILABLE" | "FULL"; available: number; occupied: number; total: number }) {
-  const isAvailable = status === "AVAILABLE";
-  const color = isAvailable ? "#1d8a4d" : "#c84d3d";
-  const bg = isAvailable ? "#edf9f1" : "#fde9e7";
-
-  return (
-    <div style={{ background: bg, borderRadius: 16, padding: 16, border: `1px solid ${color}40` }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
-        <div>
-          <strong>{title}</strong>
-          <div style={{ fontSize: 12, color: "#5e5854" }}>{label}</div>
-        </div>
-        <span style={{ background: color, color: "#fff", padding: "6px 10px", borderRadius: 999, fontSize: 12, fontWeight: 700 }}>
-          {isAvailable ? "Green flag" : "Red flag"}
-        </span>
-      </div>
-
-      <div style={{ display: "flex", justifyContent: "space-between", marginTop: 12, fontSize: 14, color: "#2e2d2b" }}>
-        <span>{available} available</span>
-        <span>{occupied} occupied</span>
-      </div>
-
-      <div style={{ height: 10, background: "rgba(0,0,0,0.08)", borderRadius: 999, overflow: "hidden", marginTop: 12 }}>
-        <div style={{ width: `${(available / total) * 100}%`, background: color, height: "100%" }} />
-      </div>
-
-      <div style={{ marginTop: 12, color: color, fontWeight: 700 }}>
-        {isAvailable ? "Seat available now" : "No seat available"}
-      </div>
-    </div>
-  );
-}
-
 function StatCard({ label, value }: { label: string; value: string | number }) {
   return (
     <div style={{ background: "#fff", borderRadius: 18, padding: 22, border: "1px solid #eadfce" }}>
       <div style={{ color: "#81756d", fontSize: 12, textTransform: "uppercase", letterSpacing: 1.2 }}>{label}</div>
       <div style={{ marginTop: 10, fontSize: 32, fontWeight: 800, color: "#1d1a18" }}>{value}</div>
+    </div>
+  );
+}
+
+function GroupCard({
+  label,
+  group,
+  peopleOnly = false,
+}: {
+  label: string;
+  group?: { people_count: number; occupied_seats: number; empty_seats: number; detected_cameras: number };
+  peopleOnly?: boolean;
+}) {
+  return (
+    <div style={{ background: "#fff", borderRadius: 18, padding: 22, border: "1px solid #eadfce" }}>
+      <div style={{ color: "#81756d", fontSize: 12, textTransform: "uppercase", letterSpacing: 1.1 }}>{label}</div>
+      <div style={{ display: "flex", gap: 18, flexWrap: "wrap", marginTop: 14, color: "#514d4a" }}>
+        <span>People <strong>{group?.people_count ?? "—"}</strong></span>
+        {!peopleOnly && <>
+          <span>Occupied <strong>{group?.occupied_seats ?? "—"}</strong></span>
+          <span>Available <strong>{group?.empty_seats ?? "—"}</strong></span>
+        </>}
+      </div>
+      <div style={{ color: "#81756d", fontSize: 12, marginTop: 12 }}>
+        {group ? `${group.detected_cameras} camera feeds reporting` : "Waiting for camera data"}
+      </div>
     </div>
   );
 }

@@ -6,7 +6,9 @@ import base64
 import math
 import threading
 import time
+from collections import deque
 from pathlib import Path
+from statistics import median
 from typing import Any
 from datetime import datetime, timezone
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
@@ -83,6 +85,16 @@ CAMERA_NAMES = {
     6: "Cabin-1",
     7: "Cabin-2",
 }
+CAMERA_PURPOSES = {
+    "cam-1": "library",
+    "cam-2": "library",
+    "cam-3": "entrance",
+    "cam-4": "library",
+    "cam-5": "entrance",
+    "cam-6": "discussion",
+    "cam-7": "discussion",
+}
+CAMERA_GROUPS = {"library", "discussion", "entrance"}
 
 
 def parse_camera_channels(value: str) -> tuple[int, ...]:
@@ -124,6 +136,7 @@ def configured_camera_sources(source: int | str, channels: tuple[int, ...]) -> l
 CAMERA_CHANNELS = parse_camera_channels(os.getenv("CAMERA_CHANNELS", "1,2,3,4,5,6,7"))
 SEAT_CONFIDENCE = float(os.getenv("SEAT_CONFIDENCE", "0.15"))
 PERSON_CONFIDENCE = float(os.getenv("PERSON_CONFIDENCE", "0.25"))
+CAMERA_PERSON_CONFIDENCE = {"cam-2": 0.15, "cam-4": 0.15}
 GENERIC_CONFIDENCE = float(os.getenv("GENERIC_CONFIDENCE", "0.2"))
 GENERIC_INFERENCE_SIZE = int(os.getenv("GENERIC_INFERENCE_SIZE", "1280"))
 GENERIC_SEAT_FALLBACK = os.getenv("GENERIC_SEAT_FALLBACK", "true").lower() == "true"
@@ -379,6 +392,61 @@ class VisionEngine:
         second_area = max(0, second[2] - second[0]) * max(0, second[3] - second[1])
         return intersection / max(first_area + second_area - intersection, 1)
 
+    @staticmethod
+    def _person_seated_in_chair(
+        chair: dict[str, Any],
+        person: dict[str, Any],
+    ) -> bool:
+        left, top, right, bottom = chair["bbox"]
+        person_left, person_top, person_right, person_bottom = person["bbox"]
+        anchor_x = (person_left + person_right) / 2
+        anchor_y = person_top + (person_bottom - person_top) * 0.7
+        return left <= anchor_x <= right and top <= anchor_y <= bottom
+
+    @staticmethod
+    def _person_anchor_in_seat_roi(
+        person: dict[str, Any],
+        frame_shape: tuple[int, ...],
+        seat_roi: list[tuple[float, float]] | None,
+    ) -> bool:
+        if not seat_roi:
+            return False
+        height, width = frame_shape[:2]
+        left, top, right, bottom = person["bbox"]
+        anchor = (
+            (left + right) / (2 * width),
+            (top + (bottom - top) * 0.7) / height,
+        )
+        return cv2.pointPolygonTest(np.asarray(seat_roi, dtype=np.float32), anchor, False) >= 0
+
+    @classmethod
+    def _matched_occupied_chairs(
+        cls,
+        chairs: list[dict[str, Any]],
+        people: list[dict[str, Any]],
+    ) -> int:
+        matches = []
+        for chair_index, chair in enumerate(chairs):
+            for person_index, person in enumerate(people):
+                if cls._person_seated_in_chair(chair, person):
+                    chair_left, chair_top, chair_right, chair_bottom = chair["bbox"]
+                    person_left, person_top, person_right, person_bottom = person["bbox"]
+                    anchor_x = (person_left + person_right) / 2
+                    anchor_y = person_top + (person_bottom - person_top) * 0.7
+                    center_x = (chair_left + chair_right) / 2
+                    center_y = (chair_top + chair_bottom) / 2
+                    distance = (anchor_x - center_x) ** 2 + (anchor_y - center_y) ** 2
+                    matches.append((distance, chair_index, person_index))
+        matches.sort()
+
+        matched_chairs = set()
+        matched_people = set()
+        for _, chair_index, person_index in matches:
+            if chair_index not in matched_chairs and person_index not in matched_people:
+                matched_chairs.add(chair_index)
+                matched_people.add(person_index)
+        return len(matched_chairs)
+
     @classmethod
     def _merge_detections(cls, *batches: list[dict[str, Any]]) -> list[dict[str, Any]]:
         detections = sorted(
@@ -480,17 +548,20 @@ class VisionEngine:
         self,
         frame: Any = None,
         seat_roi: list[tuple[float, float]] | None = None,
+        person_confidence: float | None = None,
     ) -> FrameResult:
         with self._processing_lock:
-            return self._process_frame(frame, seat_roi)
+            return self._process_frame(frame, seat_roi, person_confidence)
 
     def _process_frame(
         self,
         frame: Any = None,
         seat_roi: list[tuple[float, float]] | None = None,
+        person_confidence: float | None = None,
     ) -> FrameResult:
         if frame is None:
             return self.mock_result()
+        person_confidence = PERSON_CONFIDENCE if person_confidence is None else person_confidence
         self.last_annotated_image = None
         if self.person_model is None and self.fallback_model is None and not self.roboflow_seat_model:
             self._cache_frame(frame)
@@ -503,14 +574,14 @@ class VisionEngine:
                 self.fallback_model,
                 frame,
                 [0, 56],
-                min(PERSON_CONFIDENCE, GENERIC_CONFIDENCE),
+                min(person_confidence, GENERIC_CONFIDENCE),
                 tiled=False,
                 imgsz=GENERIC_INFERENCE_SIZE,
             )
             generic_people_detections = [
                 detection for detection in generic_predictions
                 if detection["class_id"] == 0
-                and detection["confidence"] >= PERSON_CONFIDENCE
+                and detection["confidence"] >= person_confidence
             ]
             generic_chair_detections = [
                 detection for detection in generic_predictions
@@ -519,7 +590,7 @@ class VisionEngine:
         if detector is self.fallback_model and GENERIC_SEAT_FALLBACK:
             person_detections = generic_people_detections
         else:
-            person_detections = self._predict_detections(detector, frame, [0], PERSON_CONFIDENCE) if detector else []
+            person_detections = self._predict_detections(detector, frame, [0], person_confidence) if detector else []
         if GENERIC_SEAT_FALLBACK and self.fallback_model is not detector:
             person_detections = self._merge_detections(
                 person_detections,
@@ -549,26 +620,39 @@ class VisionEngine:
                     base_image=self.last_annotated_image,
                 )
         generic_chairs = sum(detection["class_id"] == 56 for detection in generic_detections)
-        if GENERIC_SEAT_FALLBACK and generic_chairs > seat_total:
-            seat_total = generic_chairs
-            empty = max(seat_total - occupied, 0)
-        total_seats = seat_total if seat_roi is not None else seat_total or self.total_seats
-        if people > 0 and total_seats > 0:
-            if occupied > people and occupied > 0:
-                occupied = min(people, total_seats)
-            elif occupied + empty > total_seats:
-                overspill = occupied + empty - total_seats
-                occupied = max(0, occupied - overspill)
-            elif occupied == 0 and (empty == total_seats or empty == 0):
-                occupied = min(people, total_seats)
-            empty = max(total_seats - occupied, 0)
-        elif not seat_total:
-            total_seats = max(int(total_seats or 0), int(people))
-            occupied = min(people, total_seats)
-            empty = max(total_seats - occupied, 0)
-        if total_seats:
-            occupied = max(0, min(int(occupied), int(total_seats)))
+        if self.seat_model is not None:
+            total_seats = max(seat_total, generic_chairs)
+            people_in_seat_roi = sum(
+                self._person_anchor_in_seat_roi(person, frame.shape[:2], seat_roi)
+                for person in person_detections
+            )
+            generic_occupied = self._matched_occupied_chairs(
+                generic_chair_detections,
+                person_detections,
+            )
+            occupied = max(0, min(max(int(occupied), generic_occupied, people_in_seat_roi), int(total_seats)))
+            if GENERIC_SEAT_FALLBACK and self.fallback_model is not None:
+                person_limit = people_in_seat_roi if seat_roi else people
+                occupied = min(occupied, person_limit)
             empty = max(0, int(total_seats) - occupied)
+        else:
+            total_seats = seat_total if seat_roi is not None else seat_total or self.total_seats
+            if people > 0 and total_seats > 0:
+                if occupied > people and occupied > 0:
+                    occupied = min(people, total_seats)
+                elif occupied + empty > total_seats:
+                    overspill = occupied + empty - total_seats
+                    occupied = max(0, occupied - overspill)
+                elif occupied == 0 and (empty == total_seats or empty == 0):
+                    occupied = min(people, total_seats)
+                empty = max(total_seats - occupied, 0)
+            elif not seat_total:
+                total_seats = max(int(total_seats or 0), int(people))
+                occupied = min(people, total_seats)
+                empty = max(total_seats - occupied, 0)
+            if total_seats:
+                occupied = max(0, min(int(occupied), int(total_seats)))
+                empty = max(0, int(total_seats) - occupied)
         delta = people - self.last_count
         self.last_count = people
         if not person_detections and self.roboflow_seat_model:
@@ -608,6 +692,7 @@ class VisionEngine:
             ]
             if not detections:
                 self.last_annotated_image = None
+                return 0, 0, 0
             else:
                 self.last_annotated_image = self._annotate_local_detections(frame, detections, self.seat_model.names)
                 class_ids = [detection["class_id"] for detection in detections]
@@ -808,6 +893,8 @@ class CameraFeed:
         self.id = camera["id"]
         self.name = camera["name"]
         self.channel = camera["channel"]
+        self.purpose = CAMERA_PURPOSES.get(self.id, "library")
+        self.person_confidence = CAMERA_PERSON_CONFIDENCE.get(self.id, PERSON_CONFIDENCE)
         self.source = camera["source"]
         self.lifecycle_lock = threading.Lock()
         self.stop_event = threading.Event()
@@ -827,6 +914,7 @@ class CameraFeed:
         self.last_detection_at: str | None = None
         self.reconnect_attempts = 0
         self.previous_people: int | None = None
+        self.detection_history: deque[tuple[int, int, int]] = deque(maxlen=5)
 
     @staticmethod
     def _encode_preview(frame: Any, max_width: int, quality: int) -> bytes | None:
@@ -848,6 +936,9 @@ class CameraFeed:
             self.stop_event = threading.Event()
             self.status = "connecting"
             self.error = None
+            with self.condition:
+                self.detection_history.clear()
+                self.previous_people = None
             self.capture_thread = threading.Thread(
                 target=self._capture_loop,
                 args=(self.stop_event,),
@@ -919,19 +1010,32 @@ class CameraFeed:
             return self.latest_raw_sequence, self.latest_raw_frame
 
     def publish_detection(self, sequence: int, frame: Any, result: FrameResult) -> None:
-        people = result.people_count
-        previous_people = people if self.previous_people is None else self.previous_people
-        self.previous_people = people
-        result = result.model_copy(update={
-            "entries": max(people - previous_people, 0),
-            "exits": max(previous_people - people, 0),
-        })
         annotated = cv2.imdecode(
             np.frombuffer(base64.b64decode(result.annotated_image), dtype=np.uint8),
             cv2.IMREAD_COLOR,
         ) if result.annotated_image else frame
         encoded = self._encode_preview(annotated, max_width=960, quality=78)
         with self.condition:
+            self.detection_history.append((
+                result.people_count,
+                result.occupied_seats,
+                result.occupied_seats + result.empty_seats,
+            ))
+            history = tuple(self.detection_history)
+            people = int(median(sample[0] for sample in history) + 0.5)
+            occupied = int(median(sample[1] for sample in history) + 0.5)
+            total = int(median(sample[2] for sample in history) + 0.5)
+            occupied = min(occupied, people, total)
+            previous_people = people if self.previous_people is None else self.previous_people
+            self.previous_people = people
+            result = result.model_copy(update={
+                "people_count": people,
+                "occupied_seats": occupied,
+                "empty_seats": max(total - occupied, 0),
+                "occupancy_percentage": round(occupied / total * 100, 1) if total else 0,
+                "entries": max(people - previous_people, 0),
+                "exits": max(previous_people - people, 0),
+            })
             self.latest = result
             self.latest_annotated_frame = encoded
             self.annotated_sequence += 1
@@ -948,6 +1052,7 @@ class CameraFeed:
                 "id": self.id,
                 "name": self.name,
                 "channel": self.channel,
+                "purpose": self.purpose,
                 "status": self.status,
                 "stream_running": bool(self.capture_thread and self.capture_thread.is_alive()),
                 "last_frame_at": self.last_frame_at,
@@ -1072,7 +1177,11 @@ class CameraMonitor:
                 try:
                     with feed.condition:
                         seat_roi = feed.seat_roi
-                    result = self.engine.process(frame, seat_roi=seat_roi)
+                    result = self.engine.process(
+                        frame,
+                        seat_roi=seat_roi,
+                        person_confidence=feed.person_confidence,
+                    )
                     feed.publish_detection(sequence, frame, result)
                 except Exception as error:
                     feed.record_inference_error(error)
@@ -1097,8 +1206,45 @@ class CameraMonitor:
     def public_state(self) -> list[dict[str, Any]]:
         return [feed.public_state() for feed in self.feeds.values()]
 
-    def occupancy(self, camera_id: str | None) -> FrameResult:
-        return self.get_feed(camera_id).latest
+    def occupancy(self, camera_id: str | None, group: str | None = None) -> FrameResult:
+        if camera_id is not None:
+            return self.get_feed(camera_id).latest
+
+        selected_group = group or "library"
+        if selected_group not in CAMERA_GROUPS | {"all"}:
+            raise HTTPException(status_code=422, detail="Unknown camera group.")
+        feeds = [
+            feed
+            for feed in self.feeds.values()
+            if selected_group == "all" or feed.purpose == selected_group
+        ]
+        results = [
+            (feed.purpose, feed.latest)
+            for feed in feeds
+            if feed.status == "connected" and feed.latest.mode != "waiting"
+        ]
+        if not results:
+            return FrameResult(mode="waiting")
+
+        people = sum(result.people_count for _, result in results)
+        seating_results = [
+            result
+            for purpose, result in results
+            if purpose != "entrance"
+        ]
+        occupied = sum(result.occupied_seats for result in seating_results)
+        empty = sum(result.empty_seats for result in seating_results)
+        total = occupied + empty
+        modes = {result.mode for _, result in results}
+        return FrameResult(
+            people_count=people,
+            occupied_seats=occupied,
+            empty_seats=empty,
+            occupancy_percentage=round(occupied / total * 100, 1) if total else 0,
+            entries=sum(result.entries for _, result in results),
+            exits=sum(result.exits for _, result in results),
+            mode=modes.pop() if len(modes) == 1 else "multi-camera",
+        )
 
 
 engine = VisionEngine()
@@ -1153,9 +1299,12 @@ def clear_camera_roi(camera_id: str):
 
 
 @app.get("/ai/occupancy", response_model=FrameResult)
-def occupancy(camera_id: str | None = Query(default=None)):
+def occupancy(
+    camera_id: str | None = Query(default=None),
+    group: str | None = Query(default=None, pattern="^(library|discussion|entrance|all)$"),
+):
     if camera_monitor.feeds:
-        return camera_monitor.occupancy(camera_id)
+        return camera_monitor.occupancy(camera_id, group)
     return engine.latest
 
 

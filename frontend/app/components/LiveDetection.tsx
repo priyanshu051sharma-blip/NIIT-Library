@@ -1,6 +1,7 @@
 "use client";
 
 import { ChangeEvent, MouseEvent, useCallback, useEffect, useRef, useState } from "react";
+import { CameraFeed, useOccupancy } from "../context/OccupancyContext";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const AI_API = process.env.NEXT_PUBLIC_AI_SERVICE_URL || "http://localhost:8001";
@@ -16,54 +17,19 @@ type DetectionResult = {
 
 type SeatPoint = [number, number];
 
-type CameraFeedState = {
-  id: string;
-  name: string;
-  channel: number | null;
-  status: string;
-  stream_running: boolean;
-  last_frame_at: string | null;
-  last_detection_at: string | null;
-  reconnect_attempts: number;
-  error: string | null;
-  seat_roi: SeatPoint[] | null;
-  calibrated: boolean;
-  occupancy: DetectionResult;
-};
-
 function normalizeDetectionResult(occupancy: Partial<DetectionResult> | null | undefined): DetectionResult | null {
   if (!occupancy) return null;
 
   const people = Math.max(0, Number(occupancy.people_count ?? occupancy.occupied_seats ?? 0));
   const occupied = Math.max(0, Number(occupancy.occupied_seats ?? 0));
   const empty = Math.max(0, Number(occupancy.empty_seats ?? 0));
-  const totalSeats = Math.max(1, occupied + empty || people || 1);
-
-  let correctedOccupied = occupied;
-  let correctedEmpty = empty;
-
-  if (people > 0) {
-    if (correctedOccupied > people && correctedOccupied > 0) {
-      correctedOccupied = Math.min(people, totalSeats);
-      correctedEmpty = Math.max(totalSeats - correctedOccupied, 0);
-    } else if (correctedOccupied + correctedEmpty > totalSeats) {
-      const overspill = correctedOccupied + correctedEmpty - totalSeats;
-      correctedOccupied = Math.max(0, correctedOccupied - overspill);
-      correctedEmpty = Math.max(totalSeats - correctedOccupied, 0);
-    } else if (correctedOccupied === 0 && correctedEmpty === totalSeats && totalSeats > 0) {
-      correctedOccupied = Math.min(people, totalSeats);
-      correctedEmpty = Math.max(totalSeats - correctedOccupied, 0);
-    }
-  } else if (totalSeats > 0) {
-    correctedOccupied = 0;
-    correctedEmpty = totalSeats;
-  }
+  const totalSeats = occupied + empty;
 
   return {
     people_count: people,
-    occupied_seats: correctedOccupied,
-    empty_seats: correctedEmpty,
-    occupancy_percentage: totalSeats > 0 ? Number(((correctedOccupied / totalSeats) * 100).toFixed(1)) : 0,
+    occupied_seats: occupied,
+    empty_seats: empty,
+    occupancy_percentage: totalSeats > 0 ? Number(((occupied / totalSeats) * 100).toFixed(1)) : 0,
     mode: occupancy.mode ?? "unknown",
     annotated_image: occupancy.annotated_image ?? null,
   };
@@ -77,8 +43,6 @@ export default function LiveDetection() {
   const [cameraOn, setCameraOn] = useState(false);
   const [ipCameraOn, setIpCameraOn] = useState(true);
   const [ipCameraStatus, setIpCameraStatus] = useState("connecting");
-  const [cameraFrameKey, setCameraFrameKey] = useState(0);
-  const [cameraFeeds, setCameraFeeds] = useState<CameraFeedState[]>([]);
   const [calibratingCameraId, setCalibratingCameraId] = useState<string | null>(null);
   const [calibrationPoints, setCalibrationPoints] = useState<SeatPoint[]>([]);
   const [calibrationBusy, setCalibrationBusy] = useState(false);
@@ -86,42 +50,21 @@ export default function LiveDetection() {
   const [result, setResult] = useState<DetectionResult | null>(null);
   const [sourceImage, setSourceImage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const { snapshot } = useOccupancy();
+  const cameraFeeds = snapshot?.cameras ?? [];
+  const librarySummary = snapshot?.camera_groups.library;
+  const discussionSummary = snapshot?.camera_groups.discussion;
+  const entranceSummary = snapshot?.camera_groups.entrance;
+  const cameraFrameKey = snapshot?.timestamp ?? "waiting";
+  const libraryTotal = librarySummary?.total_seats ?? 0;
+  const discussionTotal = discussionSummary?.total_seats ?? 0;
+  const cameraStatusText = ipCameraOn
+    ? snapshot
+      ? `${cameraFeeds.filter((feed) => feed.status === "connected").length} of ${cameraFeeds.length} cameras connected`
+      : ipCameraStatus
+    : ipCameraStatus;
 
   useEffect(() => () => stopCamera(), []);
-
-  useEffect(() => {
-    if (!ipCameraOn) return;
-    let active = true;
-
-    async function refreshIpCamera() {
-      try {
-        const response = await fetch(`${AI_API}/ai/cameras`, { cache: "no-store" });
-        if (!response.ok) throw new Error("Could not read camera status or detection results.");
-        const feeds = (await response.json()) as CameraFeedState[];
-        if (!active) return;
-        setCameraFeeds(feeds);
-        setCameraFrameKey(Date.now());
-        const connected = feeds.filter((feed) => feed.status === "connected").length;
-        setIpCameraStatus(`${connected} of ${feeds.length} cameras connected`);
-        const primaryFeed = feeds.find((feed) => feed.id === "cam-2") ?? feeds[0];
-        if (primaryFeed) setResult(normalizeDetectionResult(primaryFeed.occupancy));
-        const firstError = feeds.find((feed) => feed.error)?.error;
-        if (firstError) setError(firstError);
-        else setError(null);
-      } catch (requestError) {
-        if (!active) return;
-        setIpCameraStatus("unavailable");
-        setError(requestError instanceof Error ? requestError.message : "Could not read IP camera status.");
-      }
-    }
-
-    void refreshIpCamera();
-    const timer = window.setInterval(() => void refreshIpCamera(), 2000);
-    return () => {
-      active = false;
-      window.clearInterval(timer);
-    };
-  }, [ipCameraOn]);
 
   const analyze = useCallback(async (dataUrl: string) => {
     busyRef.current = true;
@@ -217,7 +160,7 @@ export default function LiveDetection() {
     reader.readAsDataURL(file);
   }
 
-  function beginCalibration(feed: CameraFeedState) {
+  function beginCalibration(feed: CameraFeed) {
     setCalibrationPoints(feed.seat_roi ?? []);
     setCalibratingCameraId(feed.id);
     setError(null);
@@ -247,9 +190,6 @@ export default function LiveDetection() {
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail || "Could not save this camera's seat area.");
-      setCameraFeeds((feeds) => feeds.map((feed) => feed.id === calibratingCameraId
-        ? { ...feed, seat_roi: calibrationPoints, calibrated: true }
-        : feed));
       setCalibratingCameraId(null);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Could not save this camera's seat area.");
@@ -268,9 +208,6 @@ export default function LiveDetection() {
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail || "Could not remove this camera's seat area.");
-      setCameraFeeds((feeds) => feeds.map((feed) => feed.id === calibratingCameraId
-        ? { ...feed, seat_roi: null, calibrated: false }
-        : feed));
       setCalibrationPoints([]);
       setCalibratingCameraId(null);
     } catch (requestError) {
@@ -292,14 +229,37 @@ export default function LiveDetection() {
         {cameraOn && <button onClick={captureFrame} disabled={busy} style={{ ...buttonStyle, background: "#1d1b19" }}>{busy ? "Detecting..." : "Detect now"}</button>}
       </div>
       <p style={{ color: "#645d58", marginBottom: 0 }}>
-        The seven RTSP feeds connect server-side; credentials are not sent to the browser. Status: {ipCameraStatus}
+        The seven RTSP feeds connect server-side; credentials are not sent to the browser.         Status: {cameraStatusText}
+      </p>
+      <p style={{ color: "#81756d", fontSize: 13 }}>
+        People are person detections; occupied seats use seat classifications and people inside the calibrated seating area. People outside that area do not count as seated.
       </p>
       {error && <p style={{ color: "#a63125" }}>{error}</p>}
 
       {ipCameraOn ? (
         <>
           <h3 style={{ marginBottom: 8 }}>Live camera feeds and AI detection</h3>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 16, marginTop: 16 }}>
+          {cameraFeeds.length > 0 && (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 14, marginTop: 14 }}>
+              <CameraGroupSummary
+                title="Library seating"
+                cameras="Library-1 · Library-2 · Library-4"
+                summary={librarySummary}
+              />
+              <CameraGroupSummary
+                title="Discussion rooms"
+                cameras="Cabin-1 · Cabin-2"
+                summary={discussionSummary}
+              />
+              <CameraGroupSummary
+                title="Entrances"
+                cameras="Library Main · Library-3"
+                summary={entranceSummary}
+                peopleOnly
+              />
+            </div>
+          )}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 16, marginTop: 18 }}>
             {cameraFeeds.map((feed) => (
               <article key={feed.id} style={{ border: "1px solid #eadfce", borderRadius: 12, overflow: "hidden", minWidth: 0 }}>
                 <img
@@ -314,19 +274,28 @@ export default function LiveDetection() {
                       {feed.status}
                     </span>
                   </div>
+                  <span style={{ display: "inline-block", marginTop: 6, color: "#8a5b22", fontSize: 12 }}>
+                    {feed.purpose === "library" ? "Library seating" : feed.purpose === "discussion" ? "Discussion room" : "Entrance"}
+                  </span>
                   {feed.error && <p style={{ color: "#a63125", fontSize: 12, marginBottom: 0 }}>{feed.error}</p>}
                   <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginTop: 10, color: "#645d58", fontSize: 13 }}>
-                    <span>People: {feed.occupancy.people_count}</span>
-                    <span>Occupied: {feed.occupancy.occupied_seats}</span>
-                    <span>Empty: {feed.occupancy.empty_seats}</span>
-                    <span>Model: {feed.occupancy.mode}</span>
+                    <span>People detected: {feed.occupancy.mode === "waiting" ? "Waiting" : feed.occupancy.people_count}</span>
+                    {feed.purpose !== "entrance" && (
+                      <>
+                        <span>Occupied seats: {feed.occupancy.mode === "waiting" ? "Waiting" : feed.occupancy.occupied_seats}</span>
+                        <span>Available seats: {feed.occupancy.mode === "waiting" ? "Waiting" : feed.occupancy.empty_seats}</span>
+                      </>
+                    )}
+                    <span>Detection: {feed.purpose === "entrance" ? "people only" : feed.occupancy.mode}</span>
                   </div>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginTop: 12 }}>
-                    <span style={{ color: feed.calibrated ? "#287a48" : "#8a5b22", fontSize: 12 }}>
-                      {feed.calibrated ? "Seat area calibrated" : "Seat area not calibrated"}
-                    </span>
-                    <button onClick={() => beginCalibration(feed)} style={smallButtonStyle}>Calibrate seat area</button>
-                  </div>
+                  {feed.purpose !== "entrance" && (
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginTop: 12 }}>
+                      <span style={{ color: feed.calibrated ? "#287a48" : "#8a5b22", fontSize: 12 }}>
+                        {feed.calibrated ? "Seat area calibrated" : "Seat area not calibrated"}
+                      </span>
+                      <button onClick={() => beginCalibration(feed)} style={smallButtonStyle}>Calibrate seat area</button>
+                    </div>
+                  )}
                 </div>
               </article>
             ))}
@@ -396,7 +365,7 @@ export default function LiveDetection() {
         </div>
       )}
 
-      {result && <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 10, marginTop: 18 }}><Metric label="People in view" value={result.people_count} /><Metric label="Occupied" value={result.occupied_seats} /><Metric label="Empty" value={result.empty_seats} /><Metric label="Occupancy" value={`${result.occupancy_percentage}%`} /><Metric label="Mode" value={result.mode} /></div>}
+      {!ipCameraOn && result && <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 10, marginTop: 18 }}><Metric label="People in view" value={result.people_count} /><Metric label="Occupied" value={result.occupied_seats} /><Metric label="Available" value={result.empty_seats} /><Metric label="Occupancy" value={`${result.occupancy_percentage}%`} /><Metric label="Mode" value={result.mode} /></div>}
       <canvas ref={canvasRef} style={{ display: "none" }} />
     </section>
   );
@@ -413,4 +382,48 @@ const calibrationOverlayStyle = { position: "absolute" as const, inset: 0, width
 
 function Metric({ label, value }: { label: string; value: string | number }) {
   return <div style={{ background: "#faf3ed", borderRadius: 10, padding: 12 }}><div style={{ color: "#645d58", fontSize: 13 }}>{label}</div><strong style={{ display: "block", marginTop: 4 }}>{value}</strong></div>;
+}
+
+function CameraGroupSummary({
+  title,
+  cameras,
+  summary,
+  peopleOnly = false,
+}: {
+  title: string;
+  cameras: string;
+  summary?: {
+    people_count: number;
+    occupied_seats: number;
+    empty_seats: number;
+    total_seats: number;
+    occupancy_percentage: number;
+    detected_cameras: number;
+  };
+  peopleOnly?: boolean;
+}) {
+  const hasDetections = Boolean(summary?.detected_cameras);
+  const values: { label: string; value: string | number }[] = [
+    { label: "People", value: hasDetections ? summary?.people_count ?? 0 : "Waiting" },
+  ];
+  if (!peopleOnly) {
+    values.push(
+      { label: "Occupied seats", value: hasDetections ? summary?.occupied_seats ?? 0 : "Waiting" },
+      { label: "Available seats", value: hasDetections ? summary?.empty_seats ?? 0 : "Waiting" },
+      { label: "Seat load", value: hasDetections ? `${summary?.occupancy_percentage ?? 0}%` : "Waiting" },
+    );
+  }
+
+  return (
+    <section style={{ background: "#faf5ef", border: "1px solid #eadfce", borderRadius: 14, padding: 16 }}>
+      <h4 style={{ margin: 0, color: "#1d1b19" }}>{title}</h4>
+      <p style={{ margin: "5px 0 14px", color: "#81756d", fontSize: 12 }}>{cameras}</p>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: 10 }}>
+        {values.map(({ label, value }) => <Metric key={label} label={label} value={value} />)}
+      </div>
+      <p style={{ margin: "12px 0 0", color: "#81756d", fontSize: 12 }}>
+        {summary ? `${summary.detected_cameras} camera feeds reporting` : "Waiting for camera data"}
+      </p>
+    </section>
+  );
 }
